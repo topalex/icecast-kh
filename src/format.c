@@ -471,7 +471,8 @@ int format_general_headers (format_plugin_t *plugin, client_t *client)
             else
             {
                 if (strcasecmp (var->name, "ice-password") &&
-                        strcasecmp (var->name, "icy-metaint"))
+                        strcasecmp (var->name, "icy-metaint") &&
+                            strncasecmp ("icy-notice", var->name, 10))
                 {
                     if (!strncasecmp ("ice-", var->name, 4))
                     {
