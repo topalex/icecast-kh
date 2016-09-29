@@ -344,7 +344,7 @@ static void _ch_root_uid_setup(void)
 #ifdef HAVE_SETRESUID
            if (setresuid (uid, uid, uid) < 0)
 #else
-           if (setuid (gid) < 0)
+           if (setuid (uid) < 0)
 #endif
                fprintf (stdout, "Error changing userid: %s.\n", strerror(errno));
            else
