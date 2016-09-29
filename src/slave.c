@@ -331,7 +331,7 @@ static http_parser_t *get_relay_response (connection_t *con, const char *mount,
         const char *server, const char *headers)
 {
     ice_config_t *config = config_get_config ();
-    char *server_id = strdup (config->server_id);
+    char *relay_ua = strdup (config->relay_ua ? config->relay_ua : config->server_id);
     http_parser_t *parser = NULL;
     char response [4096];
 
@@ -348,11 +348,11 @@ static http_parser_t *get_relay_response (connection_t *con, const char *mount,
             "%s"
             "\r\n",
             mount,
-            server_id,
+            relay_ua,
             server,
             headers ? headers : "");
 
-    free (server_id);
+    free (relay_ua);
     memset (response, 0, sizeof(response));
     if (util_read_header (con->sock, response, 4096, READ_ENTIRE_HEADER) == 0)
     {

@@ -369,6 +369,7 @@ void config_clear(ice_config_t *c)
     free(c->config_filename);
 
     xmlFree (c->server_id);
+    if (c->relay_ua) xmlFree(c->relay_ua);
     if (c->location) xmlFree(c->location);
     if (c->admin) xmlFree(c->admin);
     if (c->source_password) xmlFree(c->source_password);
@@ -1321,6 +1322,8 @@ static int _parse_root (xmlNodePtr node, ice_config_t *config)
         { "admin",              config_get_str,     &config->admin },
         { "server_id",          config_get_str,     &config->server_id },
         { "server-id",          config_get_str,     &config->server_id },
+        { "relay-ua",          	config_get_str,     &config->relay_ua },
+        { "relay_ua",          	config_get_str,     &config->relay_ua },
         { "source-password",    config_get_str,     &config->source_password },
         { "hostname",           config_get_str,     &config->hostname },
         { "port",               config_get_port,    &config->port },

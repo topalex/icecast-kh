@@ -302,6 +302,7 @@ typedef struct ice_config_tag
     mount_proxy *mounts;
 
     char *server_id;
+    char *relay_ua;
     char *base_dir;
     char *log_dir;
     char *pidfile;
