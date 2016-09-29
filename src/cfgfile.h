@@ -258,6 +258,7 @@ typedef struct ice_config_tag
     int client_timeout;
     int header_timeout;
     int source_timeout;
+    int relay_timeout;
     int ice_login;
     int64_t max_bandwidth;
     int fileserve;

@@ -41,6 +41,7 @@
 #define CONFIG_DEFAULT_CLIENT_TIMEOUT 30
 #define CONFIG_DEFAULT_HEADER_TIMEOUT 15
 #define CONFIG_DEFAULT_SOURCE_TIMEOUT 10
+#define CONFIG_DEFAULT_RELAY_TIMEOUT 4
 #define CONFIG_DEFAULT_SOURCE_PASSWORD "changeme"
 #define CONFIG_DEFAULT_RELAY_PASSWORD "changeme"
 #define CONFIG_DEFAULT_MASTER_USERNAME "relay"
@@ -550,6 +551,7 @@ static void _set_defaults(ice_config_t *configuration)
     configuration->client_timeout = CONFIG_DEFAULT_CLIENT_TIMEOUT;
     configuration->header_timeout = CONFIG_DEFAULT_HEADER_TIMEOUT;
     configuration->source_timeout = CONFIG_DEFAULT_SOURCE_TIMEOUT;
+    configuration->relay_timeout = CONFIG_DEFAULT_RELAY_TIMEOUT;
     configuration->source_password = (char *)xmlCharStrdup (CONFIG_DEFAULT_SOURCE_PASSWORD);
     configuration->shoutcast_mount = (char *)xmlCharStrdup (CONFIG_DEFAULT_SHOUTCAST_MOUNT);
     configuration->ice_login = CONFIG_DEFAULT_ICE_LOGIN;
@@ -1210,6 +1212,7 @@ static int _parse_limits (xmlNodePtr node, void *arg)
         { "header-timeout", config_get_int,    &config->header_timeout },
         { "source-timeout", config_get_int,    &config->source_timeout },
         { "inactivity-timeout", config_get_int,    &config->inactivity_timeout },
+        { "relay-timeout",  	config_get_int,   	&config->relay_timeout },
         { NULL, NULL, NULL },
     };
     if (parse_xml_tags (node, icecast_tags))

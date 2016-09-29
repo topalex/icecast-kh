@@ -79,6 +79,7 @@ struct master_conn_details
     int previous;
     int ok;
     int max_interval;
+    int timeout;
     int run_on;
     time_t synctime;
     char *buffer;
@@ -729,7 +730,9 @@ static relay_server *create_master_relay (const char *local, const char *remote,
         m->bind = (char *)xmlStrdup (XMLSTR(master->bind));
     // may need to add the admin link later instead of assuming mount is as-is
     m->mount = (char *)xmlStrdup (XMLSTR(remote));
-    m->timeout = 4;
+    m->timeout = master->timeout;
+    if (m->timeout < 1 || m->timeout > 60)
+        m->timeout = 4;
     relay->hosts = m;
 
     relay->localmount = (char *)xmlStrdup (XMLSTR(local));
@@ -1053,6 +1056,7 @@ static void update_from_master (ice_config_t *config)
     details->on_demand = config->on_demand;
     details->server_id = strdup (config->server_id);
     details->max_interval = config->master_relay_retry;
+    details->timeout = config->relay_timeout;
     details->run_on = config->master_run_on;
     if (config->master_redirect)
     {
