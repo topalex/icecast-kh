@@ -833,41 +833,17 @@ static size_t streamlist_data (void *ptr, size_t size, size_t nmemb, void *strea
 {
     struct master_conn_details *master = stream;
     size_t passed_len = size*nmemb;
-    size_t len = passed_len;
-    char *buffer = ptr, *buf = ptr;
-    int prev = 0;
+    size_t len = passed_len + master->previous + 1;
+    char *buffer, *buf;
 
     if (master->ok == 0)
         return passed_len;
-    if (master->previous)
-    {
-        char *eol = memchr (ptr, '\n', passed_len < 150 ? passed_len : 150);
-        if (eol == NULL)
-        {
-            if (passed_len > 150 || master->previous > 200)
-            {
-                WARN1 ("long line received for append, ignoring %ld", (long)passed_len);
-                return (master->ok = 0);
-            }
-            buffer = realloc (master->buffer, len + 1);
-            if (buffer == NULL) return 0;
-            master->buffer = buffer;
-            memcpy (master->buffer + master->previous, ptr, passed_len);
-            master->buffer [len] = '\0';
-            master->previous = len;
-            return passed_len;
-        }
-        // just fill out enough for 1 entry
-        len = (eol - buffer) + 1 + master->previous;
-        buffer = realloc (master->buffer, len + 1);
-        if (buffer == NULL) return 0;
-        master->buffer = buffer;
-        prev = len - master->previous;
-        memcpy (buffer+master->previous, ptr, prev);
-        buffer [len] = '\0';
-        buf = buffer;
-    }
+    /* append newly read data to the end of any previous unprocess data */
+    buffer = realloc (master->buffer, len);
+    memcpy (buffer + master->previous, ptr, passed_len);
+    buffer [len-1] = '\0';
 
+    buf = buffer;
     avl_tree_wlock (global.relays);
     while (len)
     {
@@ -883,9 +859,9 @@ static size_t streamlist_data (void *ptr, size_t size, size_t nmemb, void *strea
         else
         {
             /* incomplete line, the rest may be in the next read */
-            master->buffer = calloc (1, len + 1);
-            memcpy (master->buffer, buf, len);
-            master->previous = len;
+            unsigned rest = strlen (buf);
+            memmove (buffer, buf, rest);
+            master->previous = rest;
             break;
         }
 
@@ -898,17 +874,9 @@ static size_t streamlist_data (void *ptr, size_t size, size_t nmemb, void *strea
             DEBUG1 ("skipping \"%s\"", buf);
         buf += offset;
         len -= offset;
-        if (len == 0 && prev)
-        {
-            buf = ptr + prev;
-            len =  passed_len - prev;
-            free (master->buffer);
-            master->buffer = NULL;
-            master->previous = 0;
-            prev = 0;
-        }
     }
     avl_tree_unlock (global.relays);
+    master->buffer = buffer;
     return passed_len;
 }
 
