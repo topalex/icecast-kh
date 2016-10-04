@@ -330,6 +330,13 @@ typedef struct ice_config_tag
     int num_yp_directories;
 } ice_config_t;
 
+struct cfg_tag
+{
+    const char *name;
+    int (*retrieve) (xmlNodePtr node, void *x);
+    void *storage;
+};
+
 typedef struct {
     rwlock_t config_lock;
 } ice_config_locks;
@@ -337,7 +344,11 @@ typedef struct {
 void config_initialize(void);
 void config_shutdown(void);
 
+int config_get_str (xmlNodePtr node, void *x);
+int config_get_int (xmlNodePtr node, void *x);
+int config_get_port (xmlNodePtr node, void *x);
 int config_parse_file(const char *filename, ice_config_t *configuration);
+int parse_xml_tags (xmlNodePtr parent, const struct cfg_tag *args);
 int config_initial_parse_file(const char *filename);
 int config_parse_cmdline(int arg, char **argv);
 void config_set_config (ice_config_t *new_config, ice_config_t *old_config);

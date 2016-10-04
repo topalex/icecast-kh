@@ -91,16 +91,6 @@ static void release_locks(void) {
 }
 
 
-/* 
- */
-struct cfg_tag
-{
-    const char *name;
-    int (*retrieve) (xmlNodePtr node, void *x);
-    void *storage;
-};
-
-
 /* Process xml node for boolean value, it may be true, yes, or 1
  */
 int config_get_bool (xmlNodePtr node, void *x)
