@@ -711,10 +711,9 @@ static int relay_installed (relay_server *relay)
 
 
 #ifdef HAVE_CURL
-static relay_server *create_master_relay (const char *local, const char *remote, format_type_t t, struct master_conn_details *master)
+static relay_server *create_master_relay (const char *local, const char *remote, format_type_t t, struct master_conn_details *master, relay_server_host *host)
 {
     relay_server *relay;
-    relay_server_host *m;
 
     if (local[0] != '/')
     {
@@ -723,17 +722,22 @@ static relay_server *create_master_relay (const char *local, const char *remote,
     }
     relay = calloc (1, sizeof (relay_server));
 
-    m = calloc (1, sizeof (relay_server_host));
-    m->ip = (char *)xmlStrdup (XMLSTR(master->server));
-    m->port = master->port;
-    if (master->bind)
-        m->bind = (char *)xmlStrdup (XMLSTR(master->bind));
-    // may need to add the admin link later instead of assuming mount is as-is
-    m->mount = (char *)xmlStrdup (XMLSTR(remote));
-    m->timeout = master->timeout;
-    if (m->timeout < 1 || m->timeout > 60)
-        m->timeout = 4;
-    relay->hosts = m;
+    if (host != NULL)
+        relay->hosts = host;
+    else
+    {
+        relay_server_host *m = calloc (1, sizeof (relay_server_host));
+        m->ip = (char *)xmlStrdup (XMLSTR(master->server));
+        m->port = master->port;
+        if (master->bind)
+            m->bind = (char *)xmlStrdup (XMLSTR(master->bind));
+        // may need to add the admin link later instead of assuming mount is as-is
+        m->mount = (char *)xmlStrdup (XMLSTR(remote));
+        m->timeout = master->timeout;
+        if (m->timeout < 1 || m->timeout > 60)
+            m->timeout = 4;
+        relay->hosts = m;
+    }
 
     relay->localmount = (char *)xmlStrdup (XMLSTR(local));
     relay->flags |= (RELAY_RUNNING | RELAY_ICY_META);
@@ -753,7 +757,7 @@ static relay_server *create_master_relay (const char *local, const char *remote,
 }
 
 
-static int add_master_relay (const char *mount, const char *type, struct master_conn_details *master)
+static int add_master_relay (const char *mount, const char *type, struct master_conn_details *master, relay_server_host *host)
 {
     int ret = -1, notfound;
     relay_server *result = NULL, find;
@@ -766,7 +770,7 @@ static int add_master_relay (const char *mount, const char *type, struct master_
     notfound = avl_get_by_key (global.relays, &find, (void*)&result);
     if (notfound || (result->flags & RELAY_CLEANUP))
     {
-        relay_server *new_relay = create_master_relay (find.localmount, mount, format_get_type (type), master);
+        relay_server *new_relay = create_master_relay (find.localmount, mount, format_get_type (type), master, host);
 
         if (new_relay)
         {
@@ -825,6 +829,93 @@ static size_t streamlist_header (void *ptr, size_t size, size_t nmemb, void *str
     return passed_len;
 }
 
+static int _parse_relay_server_host (xmlNodePtr node, void *arg)
+{
+    relay_server_host *host = arg, *nexthost = calloc (1, sizeof (relay_server_host));
+
+    struct cfg_tag icecast_tags[] =
+    {
+        { "ip",             config_get_str,     &nexthost->ip },
+        { "server",         config_get_str,     &nexthost->ip },
+        { "port",           config_get_port,    &nexthost->port },
+        { "mount",          config_get_str,     &nexthost->mount },
+        { "bind",           config_get_str,     &nexthost->bind },
+        { "timeout",        config_get_int,     &nexthost->timeout },
+        { NULL, NULL, NULL }
+    };
+
+    /* default master details taken from the default relay settings */
+    nexthost->ip = (char *)xmlCharStrdup (host->ip);
+    nexthost->mount = (char *)xmlCharStrdup (host->mount);
+    if (host->bind)
+        nexthost->bind = (char *)xmlCharStrdup (host->bind);
+    nexthost->port = host->port;
+    nexthost->timeout = host->timeout;
+
+    if (parse_xml_tags (node, icecast_tags))
+        return -1;
+
+    if (nexthost->timeout < 1 || nexthost->timeout > 60)
+        nexthost->timeout = 4;
+
+    /* place new details at the end of the list */
+    while (host->next)
+        host = host->next;
+    host->next = nexthost;
+
+    return 0;
+}
+
+static int parse_streamlist (xmlNodePtr node, struct master_conn_details *master)
+{
+    char *localmount = NULL;
+    relay_server_host *host = calloc (1, sizeof (relay_server_host));
+
+    host->ip = (char *)xmlStrdup (XMLSTR(master->server));
+    host->port = master->port;
+    if (master->bind)
+        host->bind = (char *)xmlStrdup (XMLSTR(master->bind));
+    host->mount = (char*)xmlCharStrdup ("/");
+    host->timeout = master->timeout;
+
+    struct cfg_tag icecast_tags[] =
+    {
+        { "local-mount",         config_get_str,               &localmount },
+        { "master",              _parse_relay_server_host,     host },
+        { "host",                _parse_relay_server_host,     host },
+        { "server",              config_get_str,               &host->ip },
+        { "ip",                  config_get_str,               &host->ip },
+        { "bind",                config_get_str,               &host->bind },
+        { "port",                config_get_port,              &host->port },
+        { "mount",               config_get_str,               &host->mount },
+        { "timeout",             config_get_int,               &host->timeout },
+        { NULL, NULL, NULL }
+    };
+
+    if (parse_xml_tags (node, icecast_tags))
+        return -1;
+
+    if (host->timeout < 1 || host->timeout > 60)
+        host->timeout = 4;
+
+    /* if master is set then remove the default entry at the head of the list */
+    if (host->next)
+    {
+        relay_server_host *nexthost = host;
+        host = nexthost->next;
+        if (nexthost->ip) xmlFree (nexthost->ip);
+        if (nexthost->bind) xmlFree (nexthost->bind);
+        if (nexthost->mount) xmlFree (nexthost->mount);
+        free (nexthost);
+    }
+
+    add_master_relay (localmount, NULL, master, host);
+
+    free (localmount);
+
+    return 0;
+}
+
 
 /* process mountpoint list from master server. This may be called multiple
  * times so watch for the last line in this block as it may be incomplete
@@ -868,10 +959,29 @@ static size_t streamlist_data (void *ptr, size_t size, size_t nmemb, void *strea
         if (*buf == '/')
         {
             DEBUG1 ("read from master \"%s\"", buf);
-            add_master_relay (buf, NULL, master);
+            add_master_relay (buf, NULL, master, NULL);
         }
         else
-            DEBUG1 ("skipping \"%s\"", buf);
+        {
+            xmlDocPtr doc;
+            xmlNodePtr node;
+            doc = xmlParseMemory(buf, strlen(buf));
+            if (doc != NULL) {
+                DEBUG1 ("reading XML \"%s\"", buf);
+
+                node = xmlDocGetRootElement(doc);
+                if (node != NULL && xmlStrcmp(node->name, XMLSTR("relay")) == 0) {
+                    if (parse_streamlist (node, master) < 0)
+                        WARN1 ("error parsing XML \"%s\"", buf);
+                }
+                else
+                    DEBUG1 ("skipping XML \"%s\"", buf);
+
+                xmlFreeDoc(doc);
+            }
+            else
+                DEBUG1 ("skipping \"%s\"", buf);
+        }
         buf += offset;
         len -= offset;
     }
