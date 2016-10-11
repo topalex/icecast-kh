@@ -794,6 +794,22 @@ static int add_master_relay (const char *mount, const char *type, struct master_
             result->updated = master->synctime; // avoid relay expiry
         if (streamlist_check == 0)
             INFO1 ("relay \"%s\" already in use, ignoring", mount);
+        else
+        {
+            if (notfound == 0 && host != NULL)
+            {
+                while (host)
+                {
+                    if (strcmp (host->mount, result->hosts->mount) != 0)
+                    {
+                        detach_master_relay (find.localmount, 1); // drop current one from tree
+                        streamlist_check = 0;
+                        break;
+                    }
+                    host = host->next;
+                }
+            }
+        }
     }
     return ret;
 }
