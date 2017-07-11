@@ -77,7 +77,7 @@ void logging_access_id (access_log *accesslog, client_t *client)
             httpp_getvar (client->parser, HTTPP_VAR_PROTOCOL),
             httpp_getvar (client->parser, HTTPP_VAR_VERSION));
 
-    stayed = now - client->connection.con_time;
+    stayed = (client->connection.con_time > now) ? 0 : (now - client->connection.con_time); // in case the clock has shifted
     username = (client->username && client->username[0]) ? util_url_escape (client->username) : strdup("-");
     referrer = httpp_getvar (client->parser, "referer");
     user_agent = httpp_getvar (client->parser, "user-agent");
@@ -255,13 +255,22 @@ int restart_logging (ice_config_t *config)
 }
 
 
-int start_logging (ice_config_t *config)
+int init_logging (ice_config_t *config)
 {
+    worker_logger_init();
+
     if (strcmp (config->error_log.name, "-") == 0)
         errorlog = log_open_file (stderr);
     if (strcmp(config->access_log.name, "-") == 0)
         config->access_log.logid = log_open_file (stderr);
     return restart_logging (config);
+}
+
+
+int start_logging (ice_config_t *config)
+{
+    worker_logger ();
+    return 0;
 }
 
 

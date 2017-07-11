@@ -34,11 +34,8 @@ struct _worker_t
     int count, pending_count;
     int move_allocations;
     spin_t lock;
-#ifdef _WIN32
-    SOCKET wakeup_fd[2];
-#else
-    int wakeup_fd[2];
-#endif
+    FD_t wakeup_fd[2];
+
     client_t *pending_clients;
     client_t **pending_clients_tail,
              *clients;
@@ -152,6 +149,8 @@ worker_t *worker_selected (void);
 void worker_balance_trigger (time_t now);
 void workers_adjust (int new_count);
 void worker_wakeup (worker_t *worker);
+void worker_logger_init (void);
+void worker_logger (void);
 
 
 /* client flags bitmask */

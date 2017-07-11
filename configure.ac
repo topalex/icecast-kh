@@ -1,5 +1,5 @@
 dnl Process this file with autoconf to produce a configure script.
-AC_INIT([Icecast], [2.4.0-kh3], [karl@kheyes.plus.com])
+AC_INIT([Icecast], [2.4.0-kh5], [karl@kheyes.plus.com])
 AC_CONFIG_AUX_DIR([build-aux])
 AM_INIT_AUTOMAKE([foreign])
 
@@ -63,6 +63,11 @@ AC_CHECK_TYPES([struct signalfd_siginfo],
 AC_CHECK_TYPES([uint32_t], [], [], [
 #include <inttypes.h>
 #include <stdint.h>
+])
+AC_CHECK_TYPES([SOCKET*],
+        [AC_DEFINE([FD_t], [SOCKET], [socket type for Windows])],
+        [AC_DEFINE([FD_t], [int], [socket type for the rest])], [
+#include <winsock2.h>
 ])
 if test "x$ac_cv_func_fnmatch" != "xyes" 
 then

@@ -36,6 +36,9 @@
 #ifdef HAVE_NETINET_IN_H
 #include <netinet/in.h>
 #endif
+#ifdef HAVE_ARPA_INET_H
+#include <arpa/inet.h>
+#endif
 #ifdef HAVE_NETDB_H
 #include <netdb.h>
 #endif
@@ -119,6 +122,11 @@ static int ssl_ok;
 #define SSL_OP_NO_COMPRESSION 0
 #endif
 static SSL_CTX *ssl_ctx;
+static mutex_t *ssl_mutexes = NULL;
+#if !defined(WIN32) && OPENSSL_VERSION_NUMBER < 0x10000000
+static unsigned long ssl_id_function (void);
+#endif
+static void ssl_locking_function (int mode, int n, const char *file, int line);
 #endif
 
 int header_timeout;
@@ -195,6 +203,19 @@ void connection_initialize(void)
 #ifdef HAVE_OPENSSL
     SSL_load_error_strings();                /* readable error messages */
     SSL_library_init();                      /* initialize library */
+    ssl_mutexes = malloc(CRYPTO_num_locks() * sizeof(mutex_t));
+    if (ssl_mutexes)
+    {
+        int i;
+        for (i=0; i < CRYPTO_num_locks();  i++)
+            thread_mutex_create (&ssl_mutexes[i]);
+#if !defined(WIN32) && OPENSSL_VERSION_NUMBER < 0x10000000
+        CRYPTO_set_id_callback (ssl_id_function);
+#endif
+        CRYPTO_set_locking_callback (ssl_locking_function);
+    }
+    else
+        WARN0("unable to set up internal locking for SSL, memory problem");
 #endif
 }
 
@@ -202,6 +223,20 @@ void connection_shutdown(void)
 {
     connection_listen_sockets_close (NULL, 1);
     thread_spin_destroy (&_connection_lock);
+#ifdef HAVE_OPENSSL
+#if !defined(WIN32) && OPENSSL_VERSION_NUMBER < 0x10000000
+    CRYPTO_set_id_callback(NULL);
+#endif
+    CRYPTO_set_locking_callback(NULL);
+    if (ssl_mutexes)
+    {
+        int i;
+        for(i = 0; i < CRYPTO_num_locks(); i++)
+            thread_mutex_destroy (&ssl_mutexes[i]);
+        free (ssl_mutexes);
+        ssl_mutexes = NULL;
+    }
+#endif
 }
 
 static uint64_t _next_connection_id(void)
@@ -217,6 +252,21 @@ static uint64_t _next_connection_id(void)
 
 
 #ifdef HAVE_OPENSSL
+#if !defined(WIN32) && OPENSSL_VERSION_NUMBER < 0x10000000
+static unsigned long ssl_id_function (void)
+{
+    return (unsigned long)thread_self();
+}
+#endif
+
+static void ssl_locking_function (int mode, int n, const char *file, int line)
+{
+    if (mode & CRYPTO_LOCK)
+        thread_mutex_lock_c (&ssl_mutexes[n], line, file);
+    else
+        thread_mutex_unlock_c (&ssl_mutexes[n], line, file);
+}
+
 static void get_ssl_certificate (ice_config_t *config)
 {
     ssl_ok = 0;
@@ -237,9 +287,9 @@ static void get_ssl_certificate (ice_config_t *config)
             WARN1 ("Invalid cert file %s", config->cert_file);
             break;
         }
-        if (SSL_CTX_use_PrivateKey_file (ssl_ctx, config->cert_file, SSL_FILETYPE_PEM) <= 0)
+        if (SSL_CTX_use_PrivateKey_file (ssl_ctx, config->key_file, SSL_FILETYPE_PEM) <= 0)
         {
-            WARN1 ("Invalid private key file %s", config->cert_file);
+            WARN1 ("Invalid private key file %s", config->key_file);
             break;
         }
         if (!SSL_CTX_check_private_key (ssl_ctx))
@@ -253,6 +303,9 @@ static void get_ssl_certificate (ice_config_t *config)
         }
         ssl_ok = 1;
         INFO1 ("SSL certificate found at %s", config->cert_file);
+        if (strcmp (config->cert_file, config->key_file) != 0)
+            INFO1 ("SSL private key found at %s", config->key_file);
+
         INFO1 ("SSL using ciphers %s", config->cipher_list);
         return;
     } while (0);
@@ -341,6 +394,15 @@ int connection_read (connection_t *con, void *buf, size_t len)
 
 int connection_send (connection_t *con, const void *buf, size_t len)
 {
+    if (((++con->readchk) & 7) == 7)
+    {
+        int r = sock_active (con->sock);
+        if (r == 0)
+        {
+            con->error = 1;
+            return -1;
+        }
+    }
     int bytes = sock_write_bytes (con->sock, buf, len);
     if (bytes < 0)
     {
@@ -443,6 +505,15 @@ int connection_bufs_send (connection_t *con, struct connection_bufs *vectors, in
     {
         if (not_ssl_connection (con))
         {
+            if (((++con->readchk) & 7) == 7)
+            {
+                int r = sock_active (con->sock);
+                if (r == 0)
+                {
+                    con->error = 1;
+                    return -1;
+                }
+            }
             ret = sock_writev (con->sock, p, vectors->count - i);
             if (ret < 0 && !sock_recoverable (sock_error()))
                 con->error = 1;
@@ -671,11 +742,42 @@ int connection_init (connection_t *con, sock_t sock, const char *addr)
 void connection_uses_ssl (connection_t *con)
 {
 #ifdef HAVE_OPENSSL
+    if (ssl_ctx == NULL)
+    {
+        DEBUG1 ("Detected SSL on connection from %s, but SSL not defined", con->ip);
+        con->error = 1;
+        return;
+    }
     con->ssl = SSL_new (ssl_ctx);
     SSL_set_accept_state (con->ssl);
     SSL_set_fd (con->ssl, con->sock);
     SSL_set_mode (con->ssl, SSL_MODE_ACCEPT_MOVING_WRITE_BUFFER|SSL_MODE_ENABLE_PARTIAL_WRITE);
+    DEBUG1 ("Detected SSL on connection from %s", con->ip);
 #endif
+}
+
+int connection_peek (connection_t *con)
+{
+#ifdef HAVE_OPENSSL
+    if (con->ssl == NULL)   // if set then ssl is already determined, so skip this
+    {
+        unsigned char arr[20];
+        int r = sock_peek (con->sock, (char*)arr, sizeof (arr));
+        if (r > 0)
+        {
+            if (r > 5 && arr[0] == 0x16 && arr[1] == 0x3 && arr[5] == 0x1)
+            {
+                connection_uses_ssl (con);
+                return 1;
+            }
+            return r < 10 ? 0 : 1;
+        }
+        if (r < 0)
+            return -1;
+        con->error = 1;
+    }
+#endif
+    return 0;
 }
 
 #ifdef HAVE_SIGNALFD
@@ -828,7 +930,7 @@ static client_t *accept_client (void)
     }
     do
     {
-        int i, num;
+        int i;
         refbuf_t *r;
 
         if (accept_ip_address (addr) == 0)
@@ -863,7 +965,7 @@ static client_t *accept_client (void)
                 break;
             }
         }
-        num = global.clients;
+        // long num = global.clients;
         global_unlock ();
         client->flags |= CLIENT_ACTIVE;
         return client;
@@ -1016,6 +1118,14 @@ static int http_client_request (client_t *client)
     {
         char *buf = refbuf->data + refbuf->len;
 
+        if (refbuf->len == 0)
+        {
+            if (connection_peek (&client->connection) < 0)
+            {
+                client->schedule_ms = client->worker->time_ms + (not_ssl_connection (&client->connection) ? 30 : 55);
+                return 0;
+            }
+        }
         ret = client_read_bytes (client, buf, remaining);
         if (ret > 0)
         {
@@ -1612,37 +1722,37 @@ void connection_listen_sockets_close (ice_config_t *config, int all_sockets)
 
 int connection_setup_sockets (ice_config_t *config)
 {
-    int count = 0;
+    static int sockets_setup = 2;
+    int count = 0, socket_count = 0, arr_size;
     listener_t *listener, **prev;
-    void *tmp;
 
-    if (global.server_sockets >= config->listen_sock_count)
-        return 0;
     global_lock();
-
-    tmp = realloc (global.serversock, (config->listen_sock_count*sizeof (sock_t)));
-    if (tmp) global.serversock = tmp;
-
-    tmp = realloc (global.server_conn, (config->listen_sock_count*sizeof (listener_t*)));
-    if (tmp) global.server_conn = tmp;
 
     listener = config->listen_sock;
     prev = &config->listen_sock;
-    count = global.server_sockets;
+    arr_size = count = global.server_sockets;
+    if (config->chuid && sockets_setup)
+    {
+        // in case of changowner, run through the first time as root, but reject the second run through as that will 
+        // be as a user. after that it's fine.
+        sockets_setup--;
+        if (sockets_setup == 0)
+        {
+            global_unlock();
+            return 0;
+        }
+    }
     if (count)
         INFO1 ("%d listening sockets already open", count);
     while (listener)
     {
-        int successful = 0;
+        socket_count = 0;
 
-        if (count > config->listen_sock_count)
-        {
-            ERROR2("sockets seem odd (%d,%d), skipping", count, config->listen_sock_count);
-            break;
-        }
+        sock_server_t sockets = sock_get_server_sockets (listener->port, listener->bind_address);
+
         do
         {
-            sock_t sock = sock_get_server_socket (listener->port, listener->bind_address);
+            sock_t sock = sock_get_next_server_socket (sockets);
             if (sock == SOCK_ERROR)
                 break;
             /* some win32 setups do not do TCP win scaling well, so allow an override */
@@ -1655,14 +1765,27 @@ int connection_setup_sockets (ice_config_t *config)
                 sock_close (sock);
                 break;
             }
+            if (count >= arr_size) // need to resize arrays?
+            {
+                void *tmp;
+                arr_size += 10;
+                tmp = realloc (global.serversock, (arr_size*sizeof (sock_t)));
+                if (tmp) global.serversock = tmp;
+
+                tmp = realloc (global.server_conn, (arr_size*sizeof (listener_t*)));
+                if (tmp) global.server_conn = tmp;
+            }
+
             sock_set_blocking (sock, 0);
-            successful = 1;
             global.serversock [count] = sock;
             global.server_conn [count] = listener;
             listener->refcount++;
+            socket_count++;
             count++;
-        } while(0);
-        if (successful == 0)
+        } while(1);
+
+        sock_free_server_sockets (sockets);
+        if (socket_count == 0)
         {
             if (listener->bind_address)
                 ERROR2 ("Could not create listener socket on port %d bind %s",
@@ -1675,9 +1798,10 @@ int connection_setup_sockets (ice_config_t *config)
             continue;
         }
         if (listener->bind_address)
-            INFO2 ("listener socket on port %d address %s", listener->port, listener->bind_address);
+            INFO3 ("%d listener socket(s) for port %d address %s", socket_count, listener->port, listener->bind_address);
         else
-            INFO1 ("listener socket on port %d", listener->port);
+            INFO2 ("%d listener socket(s) for port %d", socket_count, listener->port);
+
         prev = &listener->next;
         listener = listener->next;
     }
@@ -1694,12 +1818,12 @@ int connection_setup_sockets (ice_config_t *config)
 
 void connection_close(connection_t *con)
 {
-    if (con->sock != SOCK_ERROR)
-        sock_close (con->sock);
-    free (con->ip);
 #ifdef HAVE_OPENSSL
     if (con->ssl) { SSL_shutdown (con->ssl); SSL_free (con->ssl); }
 #endif
+    if (con->sock != SOCK_ERROR)
+        sock_close (con->sock);
+    free (con->ip);
     memset (con, 0, sizeof (connection_t));
     con->sock = SOCK_ERROR;
 }
