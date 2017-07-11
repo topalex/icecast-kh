@@ -418,7 +418,7 @@ void thread_mutex_destroy_c (mutex_t *mutex, int line, const char *file)
 #endif
 }
 
-void thread_mutex_lock_c(mutex_t *mutex, int line, char *file)
+void thread_mutex_lock_c(mutex_t *mutex, int line, const char *file)
 {
 #ifdef THREAD_DEBUG
     LOG_DEBUG3("Lock on %s requested at %s:%d", mutex->name, file, line);
@@ -426,13 +426,13 @@ void thread_mutex_lock_c(mutex_t *mutex, int line, char *file)
     _mutex_lock_c(mutex, file, line);
 #ifdef THREAD_DEBUG
     mutex->lock_start = get_count();
-    mutex->file = file;
+    mutex->file = (char*)file;
     mutex->line = line;
     LOG_DEBUG3("Lock on %s acquired at %s:%d", mutex->name, file, line);
 #endif /* THREAD_DEBUG */
 }
 
-void thread_mutex_unlock_c(mutex_t *mutex, int line, char *file)
+void thread_mutex_unlock_c(mutex_t *mutex, int line, const char *file)
 {
     _mutex_unlock_c(mutex, file, line);
 #ifdef THREAD_DEBUG
@@ -826,14 +826,13 @@ void thread_library_unlock(void)
 void thread_join(thread_type *thread)
 {
     void *ret;
-    int i;
 
 #ifdef __OpenBSD__
     /* openbsd masks signals while waiting */
     while (thread->running)
         thread_sleep (200000);
 #endif
-    i = pthread_join(thread->sys_thread, &ret);
+    pthread_join (thread->sys_thread, &ret);
     _mutex_lock(&_threadtree_mutex);
     avl_delete(_threadtree, thread, _free_thread);
     _mutex_unlock(&_threadtree_mutex);
@@ -971,3 +970,42 @@ void thread_time_add_ms (struct timespec *ts, unsigned long value)
     }
 }
 
+
+int thread_mtx_create_callback (void **p, int alloc)
+{
+    mutex_t *mutex;
+    if (p == NULL)
+        return -1;
+    if (alloc)
+    {
+        mutex = malloc (sizeof(mutex_t));
+        thread_mutex_create (mutex);
+        *p = mutex;
+    }
+    else
+    {
+        mutex = *p;
+        thread_mutex_destroy (mutex);
+        free (mutex);
+        *p = NULL;
+    }
+    return 0;
+}
+
+
+int thread_mtx_lock_callback (void **p, int lock)
+{
+    mutex_t *mutex;
+    if (p == NULL)
+        return -1;
+    mutex = *p;
+    if (lock)
+    {
+        thread_mutex_lock (mutex);
+    }
+    else
+    {
+        thread_mutex_unlock (mutex);
+    }
+    return 0;
+}
