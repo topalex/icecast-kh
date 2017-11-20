@@ -3,6 +3,8 @@
  * This program is distributed under the GNU General Public License, version 2.
  * A copy of this license is included with this source.
  *
+ * Copyright 2000-2017, Karl Heyes <karl@kheyes.plus.com>
+ *
  * Copyright 2000-2004, Jack Moffitt <jack@xiph.org>, 
  *                      Michael Smith <msmith@xiph.org>,
  *                      oddsock <oddsock@xiph.org>,
@@ -87,6 +89,7 @@
 #include "httpp/httpp.h"
 #include "mpeg.h"
 #include "global.h"
+#include "stats.h"
 
 #include "logging.h"
 #define CATMODULE "auth_url"
@@ -116,6 +119,9 @@ typedef struct {
     int  auth_header_len;
     int  timelimit_header_len;
     char *userpwd;
+    int  header_chk_count;
+    char *header_chk_list;      // nulld headers to pass from client into addurl.
+    char *header_chk_prefix;    // prefix for POSTing client headers.
 } auth_url;
 
 
@@ -144,6 +150,8 @@ static void auth_url_clear(auth_t *self)
     free (url->auth_header);
     free (url->timelimit_header);
     free (url->userpwd);
+    free (url->header_chk_list);
+    free (url->header_chk_prefix);
     free (url);
 }
 
@@ -430,13 +438,10 @@ static auth_result url_add_listener (auth_client *auth_user)
     auth_t *auth = auth_user->auth;
     auth_url *url = auth->state;
     auth_thread_data *atd = auth_user->thread_data;
-    int res = 0, port, ret = AUTH_FAILED;
-    const char *tmp;
-    char *user_agent, *username, *password;
-    char *mount, *ipaddr, *server, *referer;
-    ice_config_t *config;
+
+    int res = 0, ret = AUTH_FAILED, poffset = 0;
     struct build_intro_contents *x;
-    char *userpwd = NULL, post [4096];
+    char *userpwd = NULL, post [8192];
 
     if (url->addurl == NULL || client == NULL)
         return AUTH_OK;
@@ -459,44 +464,81 @@ static auth_result url_add_listener (auth_client *auth_user)
             return AUTH_FAILED;
         }
     }
+    do
+    {
+        ice_config_t *config = config_get_config ();
+        char *user_agent, *username, *password, *mount, *ipaddr, *referer, *current_listeners,
+             *server = util_url_escape (config->hostname);
+        int port = config->port;
+        config_release_config ();
 
-    config = config_get_config ();
-    server = util_url_escape (config->hostname);
-    port = config->port;
-    config_release_config ();
-    tmp = httpp_getvar (client->parser, "user-agent");
-    if (tmp == NULL)
-        tmp = "-";
-    user_agent = util_url_escape (tmp);
-    if (client->username)
-        username  = util_url_escape (client->username);
-    else
-        username = strdup ("");
-    if (client->password)
-        password  = util_url_escape (client->password);
-    else
-        password = strdup ("");
+        const char *tmp = httpp_getvar (client->parser, "user-agent");
 
-    /* get the full uri (with query params if available) */
-    tmp = httpp_getvar (client->parser, HTTPP_VAR_QUERYARGS);
-    snprintf (post, sizeof post, "%s%s", auth_user->mount, tmp ? tmp : "");
-    mount = util_url_escape (post);
-    ipaddr = util_url_escape (client->connection.ip);
-    tmp = httpp_getvar (client->parser, "referer");
-    referer = tmp ? util_url_escape (tmp) : strdup ("");
+        if (tmp == NULL)
+            tmp = "-";
+        user_agent = util_url_escape (tmp);
 
-    snprintf (post, sizeof (post),
-            "action=listener_add&server=%s&port=%d&client=%" PRIu64 "&mount=%s"
-            "&user=%s&pass=%s&ip=%s&agent=%s&referer=%s",
-            server, port, client->connection.id, mount, username,
-            password, ipaddr, user_agent, referer);
-    free (server);
-    free (mount);
-    free (referer);
-    free (user_agent);
-    free (username);
-    free (password);
-    free (ipaddr);
+        if (client->username)
+            username  = util_url_escape (client->username);
+        else
+            username = strdup ("");
+        if (client->password)
+            password  = util_url_escape (client->password);
+        else
+            password = strdup ("");
+
+        /* get the full uri (with query params if available) */
+        tmp = httpp_getvar (client->parser, HTTPP_VAR_QUERYARGS);
+        snprintf (post, sizeof post, "%s%s", auth_user->mount, tmp ? tmp : "");
+        mount = util_url_escape (post);
+        ipaddr = util_url_escape (client->connection.ip);
+        tmp = httpp_getvar (client->parser, "referer");
+        referer = tmp ? util_url_escape (tmp) : strdup ("");
+
+        current_listeners = stats_get_value(auth->mount, "listeners");
+        if (current_listeners == NULL)
+            current_listeners = strdup("");
+
+        poffset = snprintf (post, sizeof (post),
+                "action=listener_add&server=%s&port=%d&client=%" PRIu64 "&mount=%s"
+                "&user=%s&pass=%s&ip=%s&agent=%s&referer=%s&listeners=%s",
+                server, port, client->connection.id, mount, username,
+                password, ipaddr, user_agent, referer, current_listeners);
+        free (current_listeners);
+        free (server);
+        free (mount);
+        free (referer);
+        free (user_agent);
+        free (username);
+        free (password);
+        free (ipaddr);
+    } while (0);
+
+    if (url->header_chk_list)
+    {
+        int c = url->header_chk_count, remaining = sizeof(post) - poffset;
+        char *cur_header = url->header_chk_list;
+        const char *prefix = (url->header_chk_prefix && isalnum (url->header_chk_prefix[0])) ? url->header_chk_prefix : "ClientHeader-";
+
+        for (; c ; c--)
+        {
+            int len = strlen (cur_header);
+            const char *val = httpp_getvar (client->parser, cur_header);
+            if (val)
+            {
+                char *valesc = util_url_escape (val);
+                int r = snprintf (post+poffset, remaining, "&%s%s=%s", prefix, cur_header, valesc);
+                free (valesc);
+                if (ret < 0 || ret > remaining)
+                {
+                    WARN2 ("client from %s (on %s), with long POST", &client->connection.ip[0], auth_user->mount);
+                    return AUTH_FAILED;
+                }
+                poffset += r;
+            }
+            cur_header += (len + 1); // get past next nul
+        }
+    }
 
     if (strchr (url->addurl, '@') == NULL)
     {
@@ -796,6 +838,7 @@ static void release_thread_data (auth_t *auth, void *thread_data)
 int auth_get_url_auth (auth_t *authenticator, config_options_t *options)
 {
     auth_url *url_info;
+    char *pass_headers = NULL;
 
     authenticator->release = auth_url_clear;
     authenticator->adduser = auth_url_adduser;
@@ -820,6 +863,16 @@ int auth_get_url_auth (auth_t *authenticator, config_options_t *options)
         {
             free (url_info->password);
             url_info->password = strdup (options->value);
+        }
+        if(!strcmp(options->name, "headers"))
+        {
+            free (pass_headers);
+            pass_headers = strdup (options->value);
+        }
+        if(!strcmp(options->name, "header_prefix"))
+        {
+            free (url_info->header_chk_prefix);
+            url_info->header_chk_prefix = strdup (options->value);
         }
         if(!strcmp(options->name, "listener_add"))
         {
@@ -888,6 +941,25 @@ int auth_get_url_auth (auth_t *authenticator, config_options_t *options)
         int len = strlen (url_info->username) + strlen (url_info->password) + 2;
         url_info->userpwd = malloc (len);
         snprintf (url_info->userpwd, len, "%s:%s", url_info->username, url_info->password);
+    }
+    if (pass_headers)
+    {
+        char *cur_header = pass_headers;
+        while (cur_header)
+        {
+            char *next_header = strstr (cur_header, ",");
+            url_info->header_chk_count++;
+            if (next_header)
+            {
+                *next_header=0;
+                next_header++;
+            }
+            cur_header = next_header;
+        }
+        if (url_info->header_chk_count)
+            url_info->header_chk_list = pass_headers;
+        else
+            free (pass_headers);
     }
 
     authenticator->state = url_info;

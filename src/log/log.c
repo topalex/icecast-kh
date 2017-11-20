@@ -63,7 +63,7 @@ typedef struct log_tag
     unsigned int duration;
     int archive_timestamp;
 
-    unsigned long total;
+    unsigned long buffer_bytes;
     unsigned int entries;
     unsigned int keep_entries;
     log_entry_t *written_entry;
@@ -152,9 +152,9 @@ static void log_init (log_t *log)
     log->filename = NULL;
     log->logfile = NULL;
     log->buffer = NULL;
-    log->total = 0;
+    log->buffer_bytes = 0;
     log->entries = 0;
-    log->keep_entries = 0;
+    log->keep_entries = 5;
     log->written_entry = NULL;
     log->log_head = NULL;
     log->log_tail = NULL;
@@ -299,7 +299,7 @@ void log_set_lines_kept (int log_id, unsigned int count)
     {
         log_entry_t *to_go = loglist [log_id].log_head;
         loglist [log_id].log_head = to_go->next;
-        loglist [log_id].total -= to_go->len;
+        loglist [log_id].buffer_bytes -= to_go->len;
         free (to_go->line);
         free (to_go);
         loglist [log_id].entries--;
@@ -332,10 +332,19 @@ void log_reopen(int log_id)
     if (log_id < 0 && log_id >= LOG_MAXLOGS)
         return;
     _lock_logger();
-    if (loglist [log_id] . filename && loglist [log_id] . logfile)
+    do
     {
-        loglist [log_id].reopen_at = (time_t)0;
-    }
+        if (loglist [log_id] . filename == NULL || loglist [log_id] . logfile == NULL)
+            break;
+        if (loglist [log_id]. archive_timestamp < 0)
+        {
+            struct stat st;
+            if (stat (loglist [log_id] . filename, &st) == 0)
+                break;
+            // a missing log indicates an external move so trigger a reopen
+        }
+        loglist [log_id].size = loglist [log_id].trigger_level + 1;
+    } while (0);
     _unlock_logger();
 }
 
@@ -352,7 +361,7 @@ void log_close(int log_id)
     }
 
     int loop = 0;
-    while (++loop < 100 && do_log_run (log_id) > 0)
+    while (++loop < 10 && do_log_run (log_id) > 0)
         ;
     loglist[log_id].level = 2;
     free (loglist[log_id].filename);
@@ -368,11 +377,12 @@ void log_close(int log_id)
     {
         log_entry_t *to_go = loglist [log_id].log_head;
         loglist [log_id].log_head = to_go->next;
-        loglist [log_id].total -= to_go->len;
+        loglist [log_id].buffer_bytes -= to_go->len;
         free (to_go->line);
         free (to_go);
         loglist [log_id].entries--;
     }
+    loglist [log_id].written_entry = NULL;
     loglist [log_id].entries = 0;
     loglist[log_id].in_use = 0;
     _unlock_logger();
@@ -394,10 +404,10 @@ static log_entry_t *log_entry_pop (int log_id)
 {
     log_entry_t *to_go = loglist [log_id].log_head;
 
-    if (to_go == NULL || loglist [log_id].written_entry == to_go)
+    if (to_go == NULL || loglist [log_id].written_entry == NULL || loglist [log_id].written_entry == to_go)
         return NULL;
     loglist [log_id].log_head = to_go->next;
-    loglist [log_id].total -= to_go->len;
+    loglist [log_id].buffer_bytes -= to_go->len;
     loglist [log_id].entries--;
 
     if (to_go == loglist [log_id].log_tail)
@@ -433,7 +443,8 @@ static int do_log_run (int log_id)
         _unlock_logger ();
 
         // fprintf (stderr, "in log run, line is %s\n", next->line);
-        fprintf (loglist [log_id].logfile, "%s\n", next->line);
+        if (fprintf (loglist [log_id].logfile, "%s\n", next->line) >= 0)
+            loglist [log_id].size += next->len;
 
         _lock_logger ();
         next = next->next;
@@ -501,7 +512,7 @@ static int create_log_entry (int log_id, const char *line)
     len = entry->len = strlen (line);
     entry->line = malloc (entry->len+1);
     snprintf (entry->line, entry->len+1, "%s", line);
-    loglist [log_id].total += entry->len;
+    loglist [log_id].buffer_bytes += entry->len;
 
     if (loglist [log_id].log_tail)
         loglist [log_id].log_tail->next = entry;
@@ -536,7 +547,7 @@ int log_contents (int log_id, char **_contents, unsigned int *_len)
             _unlock_logger ();
             return -1;
         }
-        *_len = loglist [log_id].total + loglist [log_id].entries; // add space for newlines
+        *_len = loglist [log_id].buffer_bytes + loglist [log_id].entries; // add space for newlines
         return 1;
     }
     remain = *_len;
