@@ -164,15 +164,16 @@ void log_parse_failure (void *ctx, const char *fmt, ...)
 
 static int recheck_log_file (ice_config_t *config, int *id, const char *file)
 {
-    char fn [FILENAME_MAX];
+    char fn [FILENAME_MAX] = "";
 
-    if (file == NULL || strcmp (file, "-") == 0)
+    if (file == NULL)
     {
         log_close (*id);
         *id = -1;
         return 0;
     }
-    snprintf (fn, FILENAME_MAX, "%s%s%s", config->log_dir, PATH_SEPARATOR, file);
+    if (strcmp (file, "-") != 0)
+        snprintf (fn, FILENAME_MAX, "%s%s%s", config->log_dir, PATH_SEPARATOR, file);
     if (*id < 0)
     {
         *id = log_open (fn);
@@ -207,7 +208,8 @@ int restart_logging (ice_config_t *config)
     {
         log_set_trigger (config->error_log.logid, config->error_log.size);
         log_set_reopen_after (config->error_log.logid, config->error_log.duration);
-        log_set_lines_kept (config->error_log.logid, config->error_log.display);
+        if (config->error_log.display > 0)
+            log_set_lines_kept (config->error_log.logid, config->error_log.display);
         log_set_archive_timestamp (config->error_log.logid, config->error_log.archive);
         log_set_level (config->error_log.logid, config->error_log.level);
     }
@@ -220,7 +222,8 @@ int restart_logging (ice_config_t *config)
     {
         log_set_trigger (config->access_log.logid, config->access_log.size);
         log_set_reopen_after (config->access_log.logid, config->access_log.duration);
-        log_set_lines_kept (config->access_log.logid, config->access_log.display);
+        if (config->access_log.display > 0)
+            log_set_lines_kept (config->access_log.logid, config->access_log.display);
         log_set_archive_timestamp (config->access_log.logid, config->access_log.archive);
         log_set_level (config->access_log.logid, 4);
     }
@@ -231,7 +234,8 @@ int restart_logging (ice_config_t *config)
     {
         log_set_trigger (config->playlist_log.logid, config->playlist_log.size);
         log_set_reopen_after (config->playlist_log.logid, config->playlist_log.duration);
-        log_set_lines_kept (config->playlist_log.logid, config->playlist_log.display);
+        if (config->playlist_log.display > 0)
+            log_set_lines_kept (config->playlist_log.logid, config->playlist_log.display);
         log_set_archive_timestamp (config->playlist_log.logid, config->playlist_log.archive);
         log_set_level (config->playlist_log.logid, 4);
     }
@@ -245,7 +249,8 @@ int restart_logging (ice_config_t *config)
         {
             log_set_trigger (m->access_log.logid, m->access_log.size);
             log_set_reopen_after (m->access_log.logid, m->access_log.duration);
-            log_set_lines_kept (m->access_log.logid, m->access_log.display);
+            if (m->access_log.display > 0)
+                log_set_lines_kept (m->access_log.logid, m->access_log.display);
             log_set_archive_timestamp (m->access_log.logid, m->access_log.archive);
             log_set_level (m->access_log.logid, 4);
         }
@@ -260,7 +265,7 @@ int init_logging (ice_config_t *config)
     worker_logger_init();
 
     if (strcmp (config->error_log.name, "-") == 0)
-        errorlog = log_open_file (stderr);
+        config->error_log.logid = log_open_file (stderr);
     if (strcmp(config->access_log.name, "-") == 0)
         config->access_log.logid = log_open_file (stderr);
     return restart_logging (config);
@@ -277,7 +282,7 @@ int start_logging (ice_config_t *config)
 void stop_logging(void)
 {
     ice_config_t *config = config_get_config_unlocked();
-    log_close (errorlog);
+    log_close (config->error_log.logid);
     log_close (config->access_log.logid);
     log_close (config->playlist_log.logid);
 }
