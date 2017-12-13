@@ -435,7 +435,7 @@ int source_read (source_t *source)
         client->schedule_ms = client->worker->time_ms;
         if (source->flags & SOURCE_LISTENERS_SYNC)
         {
-            if (source->termination_count)
+            if (source->termination_count > 0)
             {
                 if (client->timer_start + 1000 < client->worker->time_ms)
                 {
@@ -679,14 +679,14 @@ static int source_client_read (client_t *client)
         }
     }
 
-    if (source->termination_count && source->termination_count <= source->listeners)
+    if (source->termination_count && source->termination_count <= (long)source->listeners)
     {
         if (client->timer_start + 1000 < client->worker->time_ms)
         {
             WARN2 ("%ld listeners still to process in terminating %s", source->termination_count, source->mount); 
             if (source->listeners != source->clients->length)
             {
-                WARN3 ("source %s has inconsist listeners (%ld, %u)", source->mount, source->listeners, source->clients->length);
+                WARN3 ("source %s has inconsistent listeners (%ld, %u)", source->mount, source->listeners, source->clients->length);
                 source->listeners = source->clients->length;
             }
             source->flags &= ~SOURCE_TERMINATING;
@@ -738,7 +738,7 @@ static int source_queue_advance (client_t *client)
     int ret;
     source_t *source = client->shared_data;
     refbuf_t *refbuf;
-    long lag;
+    uint64_t lag;
 
     if (client->refbuf == NULL && locate_start_on_queue (source, client) < 0)
         return -1;
@@ -768,41 +768,36 @@ static int source_queue_advance (client_t *client)
         client->connection.error = 1;
         return -1;
     }
-    else
+    if ((lag+source->incoming_rate) > source->queue_size_limit && client->connection.error == 0)
     {
-        //static unsigned int i = 0;
-        //if (((++i) & 7) == 7)
-            //DEBUG1 ("lag is %ld", lag);
-        if ((lag+source->incoming_rate) > source->queue_size_limit && client->connection.error == 0)
+        // if the listener is really lagging but has been received a decent
+        // amount of data then allow a requeue, else allow the drop
+        if (client->counter > (source->queue_size_limit << 1))
         {
-            // if the listener is really lagging but has been received a decent
-            // amount of data then allow a requeue, else allow the drop
-            if (client->counter > (source->queue_size_limit << 1))
+            const char *p = httpp_get_query_param (client->parser, "norequeue");
+            if (p == NULL)
             {
-                const char *p = httpp_get_query_param (client->parser, "norequeue");
-                if (p == NULL)
+                // we may need to copy the complete frame for private use
+                if (client->pos < client->refbuf->len)
                 {
-                    // we may need to copy the complete frame for private use
-                    if (client->pos < client->refbuf->len)
-                    {
-                        refbuf_t *copy = refbuf_copy (client->refbuf);
-                        client->refbuf = copy;
-                        client->flags |= CLIENT_HAS_INTRO_CONTENT;
-                        DEBUG2 ("client %s requeued copy on %s", client->connection.ip, source->mount);
-                    }
-                    else
-                    {
-                        client->refbuf = NULL;
-                        client->pos = 0;
-                    }
-                    client->check_buffer = http_source_introfile;
-                    // do not be too eager to refill socket buffer
-                    client->schedule_ms += source->incoming_rate < 16000 ? source->incoming_rate/16 : 800;
-                    return -1;
+                    refbuf_t *copy = refbuf_copy (client->refbuf);
+                    client->refbuf = copy;
+                    client->flags |= CLIENT_HAS_INTRO_CONTENT;
+                    DEBUG2 ("client %s requeued copy on %s", client->connection.ip, source->mount);
                 }
+                else
+                {
+                    client->refbuf = NULL;
+                    client->pos = 0;
+                }
+                client->check_buffer = http_source_introfile;
+                // do not be too eager to refill socket buffer
+                client->schedule_ms += source->incoming_rate < 16000 ? source->incoming_rate/16 : 800;
+                return -1;
             }
         }
     }
+
     refbuf = client->refbuf;
     if ((refbuf->flags & SOURCE_QUEUE_BLOCK) == 0 || refbuf->len > 66000)  abort();
 
@@ -2323,6 +2318,7 @@ int source_add_listener (const char *mount, mount_proxy *mountinfo, client_t *cl
     }
     source_setup_listener (source, client);
     source->listeners++;
+
     if ((client->flags & CLIENT_ACTIVE) && (source->flags & SOURCE_RUNNING))
         do_process = 1;
     else
@@ -2566,26 +2562,29 @@ static int source_change_worker (source_t *source, client_t *client)
     worker_t *this_worker = client->worker, *worker;
     int ret = 0;
 
-    if (this_worker->move_allocations == 0 || worker_count < 2)
-        return 0;
     thread_rwlock_rlock (&workers_lock);
-    worker = worker_selected ();
-    if (worker && worker != client->worker)
+    if (this_worker->move_allocations)
     {
-        long diff = this_worker->count - worker->count;
-        if (diff > 50 || (diff > (source->listeners>>1) + 3))
+        worker = worker_selected ();
+        if (worker && worker != client->worker)
         {
-            this_worker->move_allocations--;
-            thread_rwlock_unlock (&source->lock);
-            ret = client_change_worker (client, worker);
-            if (ret)
-                DEBUG2 ("moving source from %p to %p", this_worker, worker);
-            else
-                thread_rwlock_wlock (&source->lock);
+            long diff = (this_worker->move_allocations < 1000000) ? this_worker->count - worker->count : 1000000;
+            if (diff > 50 || (diff > (source->listeners>>1) + 3))
+            {
+                this_worker->move_allocations--;
+                thread_rwlock_unlock (&source->lock);
+                ret = client_change_worker (client, worker);
+                thread_rwlock_unlock (&workers_lock);
+                if (ret)
+                    DEBUG2 ("moving source from %p to %p", this_worker, worker);
+                else
+                    thread_rwlock_wlock (&source->lock);
+                return ret;
+            }
         }
     }
     thread_rwlock_unlock (&workers_lock);
-    return ret;
+    return 0;
 }
 
 
@@ -2598,14 +2597,14 @@ int listener_change_worker (client_t *client, source_t *source)
     long diff;
     int ret = 0;
 
-    if (this_worker->move_allocations == 0 || worker_count < 2)
+    if (this_worker->move_allocations == 0)
         return 0;
     thread_rwlock_rlock (&workers_lock);
     dest_worker = source->client->worker;
 
     if (this_worker != dest_worker)
     {
-        diff = dest_worker->count - this_worker->count;
+        diff = (this_worker->move_allocations < 1000000) ? dest_worker->count - this_worker->count : 1;
         // do not move listener if source client worker has sufficiently more clients
         if (diff > 100)
             dest_worker = NULL;
