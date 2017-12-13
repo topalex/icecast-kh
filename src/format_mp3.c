@@ -822,6 +822,8 @@ static int validate_mpeg (source_t *source, refbuf_t *refbuf)
     if (mpeg_has_changed (mpeg_sync))
     {
         format_plugin_t *plugin = source->format;
+        char buf [30];
+
         source_mp3->qblock_sz = source_mp3->req_qblock_sz ? source_mp3->req_qblock_sz : 1400;
         if (mpeg_sync->samplerate == 0 && strcmp (plugin->contenttype, "video/MP2T") != 0)
         {
@@ -829,9 +831,12 @@ static int validate_mpeg (source_t *source, refbuf_t *refbuf)
             plugin->contenttype = strdup ("video/MP2T");
         }
         stats_lock (source->stats, NULL);
-        stats_set_args (source->stats, "audio_codecid", "%d", (mpeg_get_layer (mpeg_sync) == MPEG_AAC ? 10 : 2));
-        stats_set_args (source->stats, "mpeg_samplerate", "%d", mpeg_sync->samplerate);
-        stats_set_args (source->stats, "mpeg_channels", "%d", mpeg_get_channels (mpeg_sync));
+        snprintf (buf, sizeof buf, "%d", mpeg_get_layer (mpeg_sync) == MPEG_AAC ? 10 : 2);
+        stats_set_flags (source->stats, "audio_codecid", buf, STATS_HIDDEN);
+        snprintf (buf, sizeof buf, "%d", mpeg_sync->samplerate);
+        stats_set_flags (source->stats, "mpeg_samplerate", buf, STATS_HIDDEN);
+        snprintf (buf, sizeof buf, "%d", mpeg_get_channels (mpeg_sync));
+        stats_set_flags (source->stats, "mpeg_channels", buf, STATS_HIDDEN);
         stats_release (source->stats);
     }
     if (unprocessed > 0)
@@ -942,17 +947,11 @@ static refbuf_t *mp3_get_filter_meta (source_t *source)
     /* fill the buffer with the read data */
     bytes = source_mp3->read_count;
     refbuf->len = 0;
-    long offset_limit = (source_mp3->inline_metadata_interval<<5);
 
     while (bytes > 0)
     {
         unsigned int metadata_remaining;
 
-        if (source_mp3->offset < -offset_limit || source_mp3->offset > offset_limit)
-        {
-            ERROR3 ("bad interval vals on %s, %d, %ld", source->mount, source_mp3->offset, offset_limit);
-            abort();
-        }
         mp3_block = source_mp3->inline_metadata_interval - source_mp3->offset;
 
         /* is there only enough to account for mp3 data */

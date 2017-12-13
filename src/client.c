@@ -9,7 +9,7 @@
  *                      Karl Heyes <karl@xiph.org>
  *                      and others (see AUTHORS for details).
  *
- * Copyright 2000-2014, Karl Heyes <karl@kheyes.plus.com>
+ * Copyright 2000-2017, Karl Heyes <karl@kheyes.plus.com>
  *
  */
 
@@ -49,8 +49,8 @@
 #undef CATMODULE
 #define CATMODULE "client"
 
-int worker_count, worker_min_count;
-worker_t *worker_balance_to_check, *worker_least_used;
+int worker_count = 0, worker_min_count;
+worker_t *worker_balance_to_check, *worker_least_used, *worker_incoming = NULL;
 
 FD_t logger_fd[2];
 
@@ -158,7 +158,7 @@ void client_destroy(client_t *client)
     client->refbuf = NULL;
     client->pos = 0;
     client->intro_offset = client->connection.sent_bytes = 0;
-    client_add_worker (client);
+    client_add_incoming (client);
 }
 
 
@@ -438,6 +438,14 @@ void client_set_queue (client_t *client, refbuf_t *refbuf)
     client->pos = 0;
 }
 
+static uint64_t worker_check_time_ms (worker_t *worker)
+{
+    uint64_t tm = timing_get_time();
+    if (tm - worker->time_ms > 1000 && worker->time_ms)
+        WARN2 ("worker %p has been stuck for %" PRIu64 " ms", worker, (tm - worker->time_ms));
+    return tm;
+}
+
 
 static worker_t *find_least_busy_handler (int log)
 {
@@ -467,7 +475,7 @@ static worker_t *find_least_busy_handler (int log)
 
 worker_t *worker_selected (void)
 {
-    if ((worker_least_used->count + worker_least_used->pending_count) - worker_min_count > 20)
+    if (worker_least_used && (worker_least_used->count + worker_least_used->pending_count) - worker_min_count > 20)
         worker_least_used = find_least_busy_handler(1);
     return worker_least_used;
 }
@@ -506,6 +514,20 @@ void client_add_worker (client_t *client)
     thread_rwlock_rlock (&workers_lock);
     /* add client to the handler with the least number of clients */
     handler = worker_selected();
+    thread_spin_lock (&handler->lock);
+    thread_rwlock_unlock (&workers_lock);
+
+    worker_add_client (handler, client);
+    thread_spin_unlock (&handler->lock);
+    worker_wakeup (handler);
+}
+
+void client_add_incoming (client_t *client)
+{
+    worker_t *handler;
+
+    thread_rwlock_rlock (&workers_lock);
+    handler = worker_incoming;
     thread_spin_lock (&handler->lock);
     thread_rwlock_unlock (&workers_lock);
 
@@ -565,8 +587,7 @@ static client_t **worker_add_pending_clients (worker_t *worker)
         worker->pending_count = 0;
         thread_spin_unlock (&worker->lock);
         DEBUG2 ("Added %d pending clients to %p", count, worker);
-        if (worker->wakeup_ms > worker->time_ms+5)
-            return p;  /* only these new ones scheduled so process from here */
+        return p;  /* only these new ones scheduled so process from here */
     }
     worker->wakeup_ms = worker->time_ms + 60000;
     return &worker->clients;
@@ -579,9 +600,7 @@ static client_t **worker_wait (worker_t *worker)
 
     if (global.running == ICE_RUNNING)
     {
-        uint64_t tm = timing_get_time();
-        if (tm - worker->time_ms > 1000 && worker->time_ms)
-            WARN2 ("worker %p has been stuck for %lu ms", worker, (unsigned long)(tm - worker->time_ms));
+        uint64_t tm = worker_check_time_ms (worker);
         if (worker->wakeup_ms > tm)
             duration = (int)(worker->wakeup_ms - tm);
         if (duration > 60000) /* make duration at most 60s */
@@ -623,6 +642,7 @@ static void worker_relocate_clients (worker_t *worker)
         client_t *client = worker->clients, **prevp = &worker->clients;
 
         worker->wakeup_ms = worker->time_ms + 150;
+        worker->current_time.tv_sec = (time_t)(worker->time_ms/1000);
         while (client)
         {
             if (client->flags & CLIENT_ACTIVE)
@@ -680,29 +700,29 @@ void *worker (void *arg)
                 int ret = 0;
                 client_t *nx = client->next_on_worker;
 
-                int process = (worker->running == 0 || client->schedule_ms <= sched_ms) ? 1 : 0;
-                if (process)
+                int process = 1;
+                if (worker->running)  // force all active clients to run on worker shutdown
                 {
-                    if (c > 300 && c & 1)  // only process alternate clients after so many
+                    if (client->schedule_ms <= sched_ms)
+                    {
+                        if (c > 9000 && client->wakeup == NULL)
+                            process = 0;
+                    }
+                    else if (client->wakeup == NULL || *client->wakeup == 0)
+                    {
                         process = 0;
-                }
-                else if (client->wakeup && *client->wakeup)
-                {
-                    if (c & 1)
-                        process = 1; // enable this one to pass through
-                    else
-                        client->schedule_ms = worker->time_ms;
+                    }
                 }
 
                 if (process)
                 {
-                    c++;
-                    if ((c & 31) == 0)
+                    if ((c & 511) == 0)
                     {
-                        // update these after so many to keep in sync
-                        worker->time_ms = timing_get_time();
+                        // update these periodically to keep in sync
+                        worker->time_ms = worker_check_time_ms (worker);
                         worker->current_time.tv_sec = (time_t)(worker->time_ms/1000);
                     }
+                    c++;
                     ret = client->ops->process (client);
                     if (ret < 0)
                     {
@@ -748,21 +768,23 @@ void *worker (void *arg)
 // We pick a worker (consequetive) and set a max number of clients to move if needed
 void worker_balance_trigger (time_t now)
 {
-    int log_counts = (now % 10) == 0 ? 1 : 0;
 
-    if (worker_count == 1)
-        return; // no balance required, leave quickly
     thread_rwlock_rlock (&workers_lock);
-
-    // lets only search for this once a second, not many times
-    worker_least_used = find_least_busy_handler (log_counts);
-    if (worker_balance_to_check)
+    if (worker_count > 1)
     {
-        worker_balance_to_check->move_allocations = 50;
-        worker_balance_to_check = worker_balance_to_check->next;
+        int log_counts = (now & 15) == 0 ? 1 : 0;
+
+        worker_least_used = find_least_busy_handler (log_counts);
+        if (worker_balance_to_check)
+        {
+            worker_balance_to_check->move_allocations = 50;
+            worker_balance_to_check = worker_balance_to_check->next;
+        }
+        if (worker_balance_to_check == NULL)
+            worker_balance_to_check = workers;
     }
-    if (worker_balance_to_check == NULL)
-        worker_balance_to_check = workers;
+    if (worker_incoming)
+        worker_incoming->move_allocations = 2000000; // enforce a move away from this thread if possible
 
     thread_rwlock_unlock (&workers_lock);
 }
@@ -776,14 +798,25 @@ static void worker_start (void)
 
     handler->pending_clients_tail = &handler->pending_clients;
     thread_spin_create (&handler->lock);
-    thread_rwlock_wlock (&workers_lock);
     handler->last_p = &handler->clients;
+
+    thread_rwlock_wlock (&workers_lock);
+    if (worker_incoming == NULL)
+    {
+        worker_incoming = handler;
+        handler->thread = thread_create ("worker", worker, handler, THREAD_ATTACHED);
+        thread_rwlock_unlock (&workers_lock);
+        INFO0 ("starting incoming worker thread");
+        worker_start();  // single level recursion, just get a special worker thread set up
+        return;
+    }
     handler->next = workers;
     workers = handler;
     worker_count++;
     worker_least_used = worker_balance_to_check = workers;
-    handler->thread = thread_create ("worker", worker, handler, THREAD_ATTACHED);
     thread_rwlock_unlock (&workers_lock);
+
+    handler->thread = thread_create ("worker", worker, handler, THREAD_ATTACHED);
 }
 
 
@@ -791,26 +824,40 @@ static void worker_stop (void)
 {
     worker_t *handler;
 
-    if (workers == NULL)
-        return;
     thread_rwlock_wlock (&workers_lock);
-    handler = workers;
-    workers = handler->next;
-    worker_least_used = worker_balance_to_check = workers;
-    if (workers)
-        workers->move_allocations = 100;
-    worker_count--;
-    thread_rwlock_unlock (&workers_lock);
+    do
+    {
+        if (worker_count > 0)
+        {
+            handler = workers;
+            workers = handler->next;
+            worker_least_used = worker_balance_to_check = workers;
+            if (workers)
+                workers->move_allocations = 100;
+            worker_count--;
+        }
+        else
+        {
+            handler = worker_incoming;
+            worker_incoming = NULL;
+            INFO0 ("stopping incoming worker thread");
+        }
+        thread_rwlock_unlock (&workers_lock);
 
-    handler->running = 0;
-    worker_wakeup (handler);
+        if (handler)
+        {
+            handler->running = 0;
+            worker_wakeup (handler);
 
-    thread_join (handler->thread);
-    thread_spin_destroy (&handler->lock);
+            thread_join (handler->thread);
+            thread_spin_destroy (&handler->lock);
 
-    sock_close (handler->wakeup_fd[1]);
-    sock_close (handler->wakeup_fd[0]);
-    free (handler);
+            sock_close (handler->wakeup_fd[1]);
+            sock_close (handler->wakeup_fd[0]);
+            free (handler);
+        }
+        thread_rwlock_wlock (&workers_lock);
+    } while (workers == NULL && worker_incoming);
 }
 
 
