@@ -886,13 +886,13 @@ void sock_free_server_sockets (sock_server_t _s)
     free (s);
 }
 
-sock_t sock_get_next_server_socket (sock_server_t _s)
+int sock_get_next_server_socket (sock_server_t _s, sock_t *serversock)
 {
     struct _server_sockets *s = _s;
     struct addrinfo *ai;
 
     if (s == NULL || s->next == NULL)
-        return SOCK_ERROR;
+        return -1;
     ai = s->next;
     do
     {
@@ -914,15 +914,17 @@ sock_t sock_get_next_server_socket (sock_server_t _s)
         if (bind (sock, ai->ai_addr, ai->ai_addrlen) < 0)
         {
             sock_close (sock);
-            continue;
+            sock = SOCK_ERROR;
+            // maybe refer to the failed ai for reporting?
         }
         s->next = ai->ai_next;
-        return sock;
+        *serversock = sock;
+        return 0;
 
     } while ((ai = ai->ai_next));
     s->next = NULL;
 
-    return SOCK_ERROR;
+    return -1;
 }
 
 
@@ -943,16 +945,10 @@ int sock_try_connection (sock_t sock, const char *hostname, unsigned int port)
     memset(&server, 0, sizeof(struct sockaddr_in));
 
     if (!resolver_getip(hostname, ip, MAX_ADDR_LEN))
-    {
-        sock_close (sock);
         return -1;
-    }
 
     if (inet_aton(ip, (struct in_addr *)&sin.sin_addr) == 0)
-    {
-        sock_close(sock);
         return -1;
-    }
 
     memcpy(&server.sin_addr, &sin.sin_addr, sizeof(struct sockaddr_in));
 
@@ -971,8 +967,11 @@ sock_t sock_connect_non_blocking (const char *hostname, unsigned port)
         return SOCK_ERROR;
 
     sock_set_blocking (sock, 0);
-    sock_try_connection (sock, hostname, port);
-    
+    if (sock_try_connection (sock, hostname, port) < 0)
+    {
+        sock_close (sock);
+        sock = SOCK_ERROR;
+    }
     return sock;
 }
 
@@ -1062,7 +1061,7 @@ static int sock_alloc_sockets (struct _server_sockets *sa, int port, const char 
 }
 
 
-sock_t sock_get_next_server_socket (sock_server_t _s)
+int sock_get_next_server_socket (sock_server_t _s, sock_t *serversock)
 {
     struct sockaddr_in *sa = _s;
     sock_t sock;
@@ -1073,7 +1072,7 @@ sock_t sock_get_next_server_socket (sock_server_t _s)
     /* get a socket */
     sock = sock_open (AF_INET, SOCK_STREAM, 0);
     if (sock == -1)
-        return SOCK_ERROR;
+        return -1;
 
     sock_set_cloexec (sock);
 #ifndef WIN32
@@ -1089,8 +1088,9 @@ sock_t sock_get_next_server_socket (sock_server_t _s)
         sock_close (sock);
         sock = SOCK_ERROR;
     }
+    *serversock = sock;
 
-    return sock;
+    return 0;
 }
 
 void sock_free_server_sockets (sock_server_t _s)
@@ -1117,7 +1117,8 @@ sock_t sock_get_server_socket (int port, const char *sinterface)
 
     if (sock_alloc_sockets (s, port, sinterface) < 0)
         return SOCK_ERROR;
-    sock_t sock = sock_get_next_server_socket (s);
+    sock_t sock = SOCK_ERROR;
+    sock_get_next_server_socket (s, &sock);
     sock_free_server_sockets (s);
     return sock;
 }

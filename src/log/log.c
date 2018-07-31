@@ -138,6 +138,8 @@ static int _log_open (int id, time_t now)
             if (f == NULL)
             {
                 loglist [id] . logfile = stderr;
+                loglist [id] . trigger_level = 0;
+                loglist [id] . duration = 0;
                 do_log_run (id);
                 return 0;
             }
@@ -309,15 +311,6 @@ void log_set_lines_kept (int log_id, unsigned int count)
 
     _lock_logger ();
     loglist[log_id].keep_entries = count;
-    while (loglist[log_id].entries > count)
-    {
-        log_entry_t *to_go = loglist [log_id].log_head;
-        loglist [log_id].log_head = to_go->next;
-        loglist [log_id].buffer_bytes -= to_go->len;
-        free (to_go->line);
-        free (to_go);
-        loglist [log_id].entries--;
-    }
     _unlock_logger ();
 }
 
@@ -378,7 +371,7 @@ void log_close(int log_id)
     int loop = 0;
     while (++loop < 10 && do_log_run (log_id) > 0)
         ;
-    loglist[log_id].level = 2;
+    //loglist[log_id].level = 2;
     free (loglist[log_id].filename);
     loglist[log_id].filename = NULL;
     if (loglist[log_id].buffer) free(loglist[log_id].buffer);
@@ -405,8 +398,9 @@ void log_close(int log_id)
 
 void log_shutdown(void)
 {
-    log_commit_entries ();
-    log_close (0);
+    int log_id;
+    for (log_id = 0; log_id < logs_allocated ; log_id++)
+        log_close (log_id);
     free (loglist);
     /* destroy mutexes */
     if (log_mutex_alloc)
@@ -449,7 +443,7 @@ static int do_log_run (int log_id)
         next = loglist [log_id].written_entry->next;
 
     // fprintf (stderr, "in log run, id %d\n", log_id);
-    while (next && ++loop < 100)
+    while (next && ++loop < 300)
     {
         if (_log_open (log_id, now) == 0)
             break;
@@ -463,7 +457,6 @@ static int do_log_run (int log_id)
 
         _lock_logger ();
         next = next->next;
-        // loglist [log_id].last_entry--;
     }
     return loop;
 }
@@ -481,7 +474,7 @@ void log_commit_entries ()
             if (loglist [log_id].in_use)
                 c = do_log_run (log_id);
             if (c == 0) break;      // skip to next log
-        } while ((count += c) < 400);
+        } while ((count += c) < 10000);
     }
     _unlock_logger ();
 }
@@ -540,7 +533,8 @@ static int create_log_entry (int log_id, const char *line)
         log_callback (log_id);
     else
         do_log_run (log_id);
-    do_purge (log_id);
+    if (loglist [log_id].entries > 1)
+        do_purge (log_id);
     return len;
 }
 

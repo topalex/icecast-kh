@@ -403,33 +403,11 @@ static void mp3_set_title (source_t *source)
                 flv_meta_append_string (flvmeta, "description", str);
                 free (str);
             }
-            str = stats_retrieve (source->stats, "ice-channels");
-            if (str)
-            {
-                int chann = atoi (str);
-                flv_meta_append_bool (flvmeta, "stereo", chann == 2 ? 1 : 0);
-                free (str);
-            }
-            else
-                flv_meta_append_bool (flvmeta, "stereo", (mpeg_get_channels (mpeg_sync) == 2));
-            str = stats_retrieve (source->stats, "ice-samplerate");
-            if (str)
-            {
-                double rate = (double)atoi (str);
-                flv_meta_append_number (flvmeta, "audiosamplerate", rate);
-                free (str);
-            }
-            else
-                flv_meta_append_number (flvmeta, "audiosamplerate", (double)mpeg_sync->samplerate);
-            str = stats_retrieve (source->stats, "ice-bitrate");
-            if (str)
-            {
-                double rate = (double)atoi (str);
-                flv_meta_append_number (flvmeta, "audiodatarate", rate);
-                free (str);
-            }
+            flv_meta_append_number (flvmeta, "audiodatarate", syncframe_bitrate (mpeg_sync));
+            flv_meta_append_number (flvmeta, "audiosamplerate", syncframe_samplerate (mpeg_sync));
+            flv_meta_append_bool (flvmeta, "stereo", syncframe_channels (mpeg_sync) == 2 ? 1 : 0);
             flv_meta_append_number (flvmeta, "audiocodecid",
-                            (double)(mpeg_get_layer (mpeg_sync) == MPEG_AAC ? 10 : 2));
+                            (double)(mpeg_get_type (mpeg_sync) == FORMAT_TYPE_AAC ? 10 : 2));
         }
         if (source_mp3->url_artist && source_mp3->url_title)
         {
@@ -505,7 +483,7 @@ static void mp3_set_title (source_t *source)
  */
 static int send_icy_metadata (client_t *client, refbuf_t *refbuf)
 {
-    int ret = 0;
+    int ret = 0, len;
     char *metadata = NULL;
     int meta_len, block_len;
     refbuf_t *associated = refbuf->associated;
@@ -552,13 +530,13 @@ static int send_icy_metadata (client_t *client, refbuf_t *refbuf)
         block_len = client_mp3->interval; // handle small intervals
 
     connection_bufs_init (&bufs, 2);
-    ret = connection_bufs_append (&bufs, metadata, meta_len);
-    if (block_len && ret < client_mp3->max_send_size)
+    len = connection_bufs_append (&bufs, metadata, meta_len);
+    if (block_len && len < client_mp3->max_send_size)
     {
-        int len = client_mp3->max_send_size - ret;
+        len = client_mp3->max_send_size - len;
         if (block_len < len)
             len = block_len;
-        connection_bufs_append (&bufs, refbuf->data + client->pos, len);
+        len = connection_bufs_append (&bufs, refbuf->data + client->pos, len);
     }
     ret = connection_bufs_send (&client->connection, &bufs, 0);
     connection_bufs_release (&bufs);
@@ -573,6 +551,8 @@ static int send_icy_metadata (client_t *client, refbuf_t *refbuf)
         client->flags &= ~CLIENT_IN_METADATA;
         client_mp3->metadata_offset = 0;
         client_mp3->associated = associated; // change prev meta block
+        if (ret < len)
+            client->schedule_ms += 10 + (client->throttle * ((ret < 0) ? 10 : 6));
     }
     else
     {
@@ -581,7 +561,7 @@ static int send_icy_metadata (client_t *client, refbuf_t *refbuf)
             client->flags |= CLIENT_IN_METADATA;
             client_mp3->metadata_offset += ret;
         }
-        client->schedule_ms += 10 + (client->throttle * (ret < 0) ? 15 : 6);
+        client->schedule_ms += 10 + (client->throttle * ((ret < 0) ? 10 : 6));
     }
     return ret;
 }
@@ -640,14 +620,16 @@ static int format_mp3_write_buf_to_client (client_t *client)
         else
             ret = client_send_bytes (client, buf, len);
 
-        if (ret < len)
-            client->schedule_ms += 10 + (client->throttle * (ret < 0) ? 15 : 6);
         if (ret > 0)
         {
             client_mp3->since_meta_block += ret;
             client->pos += ret;
             client->queue_pos += ret;
             client->counter += ret;
+        }
+        if (ret < len)
+        {
+            client->schedule_ms += 10 + (client->throttle * ((ret < 0) ? 10 : 6));
         }
     }
     return ret;
@@ -698,7 +680,9 @@ static int send_iceblock_to_client (client_t *client)
         client_mpg->metadata_offset = 0;
     }
     if (ret < len)
-        client->schedule_ms += 10 + (client->throttle * (ret < 0) ? 15 : 6);
+    {
+        client->schedule_ms += 10 + (client->throttle * ((ret < 0) ? 10 : 6));
+    }
     return ret;
 }
 
@@ -753,7 +737,7 @@ static int complete_read (source_t *source)
         source_mp3->read_data = refbuf_new (source_mp3->qblock_sz);
         source_mp3->read_count = 0;
     }
-    if (source_mp3->update_metadata)
+    if (format->read_bytes > 20000 && source_mp3->update_metadata) // only update after 20k received
     {
         mp3_set_title (source);
         source_mp3->update_metadata = 0;
@@ -822,18 +806,19 @@ static int validate_mpeg (source_t *source, refbuf_t *refbuf)
     if (mpeg_has_changed (mpeg_sync))
     {
         format_plugin_t *plugin = source->format;
+        int rate = mpeg_get_samplerate (mpeg_sync);
         char buf [30];
 
         source_mp3->qblock_sz = source_mp3->req_qblock_sz ? source_mp3->req_qblock_sz : 1400;
-        if (mpeg_sync->samplerate == 0 && strcmp (plugin->contenttype, "video/MP2T") != 0)
+        if (rate == 0 && strcmp (plugin->contenttype, "video/MP2T") != 0)
         {
             free (plugin->contenttype);
             plugin->contenttype = strdup ("video/MP2T");
         }
         stats_lock (source->stats, NULL);
-        snprintf (buf, sizeof buf, "%d", mpeg_get_layer (mpeg_sync) == MPEG_AAC ? 10 : 2);
+        snprintf (buf, sizeof buf, "%d", mpeg_get_type (mpeg_sync) == FORMAT_TYPE_AAC ? 10 : 2);
         stats_set_flags (source->stats, "audio_codecid", buf, STATS_HIDDEN);
-        snprintf (buf, sizeof buf, "%d", mpeg_sync->samplerate);
+        snprintf (buf, sizeof buf, "%d", rate);
         stats_set_flags (source->stats, "mpeg_samplerate", buf, STATS_HIDDEN);
         snprintf (buf, sizeof buf, "%d", mpeg_get_channels (mpeg_sync));
         stats_set_flags (source->stats, "mpeg_channels", buf, STATS_HIDDEN);
@@ -1053,8 +1038,9 @@ static int format_mp3_create_client_data (format_plugin_t *plugin, client_t *cli
     {
         client_mp3->specific = calloc (1, sizeof(mpeg_sync));
         mpeg_setup (client_mp3->specific, client->connection.ip);
+        mpeg_check_numframes (client_mp3->specific, 1);
         if (httpp_getvar (client->parser, "__FILESIZE"))
-            mpeg_set_flags (client_mp3->specific, 1<<8);
+            mpeg_set_flags (client_mp3->specific, MPEG_KEEP_META);
     }
     if (source_mp3->max_send_size)
         client_mp3->max_send_size = source_mp3->max_send_size;
@@ -1126,7 +1112,7 @@ static void swap_client (client_t *new_client, client_t *old_client)
     old_client->format_data = NULL;
     if (mpeg_sync)
     {
-        mpeg_sync->mount = new_client->connection.ip;
+        mpeg_sync->reference = new_client->connection.ip;
         if (mpeg_sync->surplus)
         {
             len = mpeg_sync->surplus->len;

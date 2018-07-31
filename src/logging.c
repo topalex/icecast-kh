@@ -31,6 +31,8 @@
 #include "errno.h"
 #include "global.h"
 
+#define CATMODULE "logging"
+
 void fatal_error (const char *perr);
 
 /* the global log descriptors */
@@ -147,6 +149,18 @@ void logging_playlist(const char *mount, const char *metadata, long listeners)
 }
 
 
+void logging_preroll (int log_id, const char *intro_name, client_t *client)
+{
+    char datebuf[128];
+
+    util_get_clf_time (datebuf, sizeof(datebuf), client->worker->current_time.tv_sec);
+
+    log_write_direct (log_id, "%s|%s|%" PRIu64 "|%s|%ld|%s",
+             datebuf, client->mount, client->connection.id,
+             &client->connection.ip[0], (long)client->intro_offset, intro_name);
+}
+
+
 void log_parse_failure (void *ctx, const char *fmt, ...)
 {
     char line [200];
@@ -184,6 +198,7 @@ static int recheck_log_file (ice_config_t *config, int *id, const char *file)
             fatal_error (buf);
             return -1;
         }
+        INFO1 ("Using global log file %s", fn);
         return 0;
     }
     log_set_filename (*id, fn);
@@ -192,15 +207,29 @@ static int recheck_log_file (ice_config_t *config, int *id, const char *file)
 }
 
 
+static int recheck_access_log (ice_config_t *config, struct access_log *access)
+{
+    if (recheck_log_file (config, &access->logid, access->name) < 0)
+        return -1;
+    log_set_trigger (access->logid, access->size);
+    log_set_reopen_after (access->logid, access->duration);
+    if (access->display > 0)
+        log_set_lines_kept (access->logid, access->display);
+    log_set_archive_timestamp (access->logid, access->archive);
+    log_set_level (access->logid, 4);
+    return 0;
+}
+
+
 int restart_logging (ice_config_t *config)
 {
     ice_config_t *current = config_get_config_unlocked();
-    mount_proxy *m;
     int ret = 0;
 
     config->error_log.logid = current->error_log.logid;
     config->access_log.logid = current->access_log.logid;
     config->playlist_log.logid = current->playlist_log.logid;
+    config->preroll_log.logid = current->preroll_log.logid;
 
     if (recheck_log_file (config, &config->error_log.logid, config->error_log.name) < 0)
         ret = -1;
@@ -216,17 +245,20 @@ int restart_logging (ice_config_t *config)
     thread_use_log_id (config->error_log.logid);
     errorlog = config->error_log.logid; /* value stays static so avoid taking the config lock */
 
-    if (recheck_log_file (config, &config->access_log.logid, config->access_log.name) < 0)
+    if (recheck_log_file (config, &config->preroll_log.logid, config->preroll_log.name) < 0)
         ret = -1;
     else
     {
-        log_set_trigger (config->access_log.logid, config->access_log.size);
-        log_set_reopen_after (config->access_log.logid, config->access_log.duration);
-        if (config->access_log.display > 0)
-            log_set_lines_kept (config->access_log.logid, config->access_log.display);
-        log_set_archive_timestamp (config->access_log.logid, config->access_log.archive);
-        log_set_level (config->access_log.logid, 4);
+        log_set_trigger (config->preroll_log.logid, config->preroll_log.size);
+        log_set_reopen_after (config->preroll_log.logid, config->preroll_log.duration);
+        if (config->preroll_log.display > 0)
+            log_set_lines_kept (config->preroll_log.logid, config->preroll_log.display);
+        log_set_archive_timestamp (config->preroll_log.logid, config->preroll_log.archive);
+        log_set_level (config->preroll_log.logid, 4);
     }
+
+    if (recheck_access_log (config, &config->access_log) < 0)
+       ret = -1;
 
     if (recheck_log_file (config, &config->playlist_log.logid, config->playlist_log.name) < 0)
         ret = -1;
@@ -240,21 +272,30 @@ int restart_logging (ice_config_t *config)
         log_set_level (config->playlist_log.logid, 4);
     }
     playlistlog = config->playlist_log.logid;
-    m = config->mounts;
-    while (m)
+
+    // any logs for template based mounts
+    if (config->mounts)
     {
-        if (recheck_log_file (config, &m->access_log.logid, m->access_log.name) < 0)
-            ret = -1;
-        else
+        mount_proxy *m = config->mounts;
+        while (m)
         {
-            log_set_trigger (m->access_log.logid, m->access_log.size);
-            log_set_reopen_after (m->access_log.logid, m->access_log.duration);
-            if (m->access_log.display > 0)
-                log_set_lines_kept (m->access_log.logid, m->access_log.display);
-            log_set_archive_timestamp (m->access_log.logid, m->access_log.archive);
-            log_set_level (m->access_log.logid, 4);
+            if (recheck_access_log (config, &m->access_log) < 0)
+                ret = -1;
+            m = m->next;
         }
-        m = m->next;
+    }
+    // any logs for specifically named munts
+    if (config->mounts_tree)
+    {
+        avl_node *node = avl_get_first (config->mounts_tree);
+        while (node)
+        {
+            mount_proxy *m = (mount_proxy *)node->key;
+            node = avl_get_next (node);
+
+            if (recheck_access_log (config, &m->access_log) < 0)
+                ret = -1;
+        }
     }
     return ret;
 }
@@ -274,16 +315,13 @@ int init_logging (ice_config_t *config)
 
 int start_logging (ice_config_t *config)
 {
-    worker_logger ();
+    worker_logger (0);
     return 0;
 }
 
 
 void stop_logging(void)
 {
-    ice_config_t *config = config_get_config_unlocked();
-    log_close (config->error_log.logid);
-    log_close (config->access_log.logid);
-    log_close (config->playlist_log.logid);
+    worker_logger (1);
 }
 

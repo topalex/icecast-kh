@@ -115,7 +115,9 @@ static mutex_t *ssl_mutexes = NULL;
 #if !defined(WIN32) && OPENSSL_VERSION_NUMBER < 0x10000000
 static unsigned long ssl_id_function (void);
 #endif
+#if OPENSSL_VERSION_NUMBER < 0x10100000L
 static void ssl_locking_function (int mode, int n, const char *file, int line);
+#endif
 #endif
 
 int header_timeout;
@@ -310,6 +312,7 @@ static unsigned long ssl_id_function (void)
 }
 #endif
 
+#if OPENSSL_VERSION_NUMBER < 0x10100000L
 static void ssl_locking_function (int mode, int n, const char *file, int line)
 {
     if (mode & CRYPTO_LOCK)
@@ -317,6 +320,7 @@ static void ssl_locking_function (int mode, int n, const char *file, int line)
     else
         thread_mutex_unlock_c (&ssl_mutexes[n], line, file);
 }
+#endif
 
 
 static void get_ssl_certificate (ice_config_t *config)
@@ -331,7 +335,11 @@ static void get_ssl_certificate (ice_config_t *config)
         if (config->cert_file == NULL)
             break;
 
+#if (OPENSSL_VERSION_NUMBER >= 0x10100000L)
+        new_ssl_ctx = SSL_CTX_new (TLS_server_method());
+#else
         new_ssl_ctx = SSL_CTX_new (SSLv23_server_method());
+#endif
         ssl_opts = SSL_CTX_get_options (new_ssl_ctx);
         SSL_CTX_set_options (new_ssl_ctx, ssl_opts|SSL_OP_NO_SSLv2|SSL_OP_NO_SSLv3|SSL_OP_NO_COMPRESSION|SSL_OP_CIPHER_SERVER_PREFERENCE|SSL_OP_ALL);
 
@@ -368,6 +376,13 @@ static void get_ssl_certificate (ice_config_t *config)
             WARN2 ("Invalid private key file %s (%s)", config->key_file, ERR_reason_error_string (ERR_peek_last_error()));
             break;
         }
+        if (config->ca_file && SSL_CTX_load_verify_locations (new_ssl_ctx, config->ca_file, NULL) != 0)
+        {
+            WARN2 ("Invalid CA file %s (%s)", config->ca_file, ERR_reason_error_string (ERR_peek_last_error()));
+            break;
+        }
+        SSL_CTX_set_verify_depth (new_ssl_ctx,1);
+
         if (!SSL_CTX_check_private_key (new_ssl_ctx))
         {
             ERROR2 ("Invalid %s - Private key does not match cert public key (%s)", config->key_file, ERR_reason_error_string (ERR_peek_last_error()));
@@ -413,6 +428,8 @@ int connection_read_ssl (connection_t *con, void *buf, size_t len)
         case SSL_ERROR_NONE:
         case SSL_ERROR_ZERO_RETURN:
             break;
+        case SSL_ERROR_SYSCALL:
+            con->error = 1;
         case SSL_ERROR_WANT_READ:
         case SSL_ERROR_WANT_WRITE:
             return -1;
@@ -436,6 +453,10 @@ int connection_send_ssl (connection_t *con, const void *buf, size_t len)
         case SSL_ERROR_NONE:
         case SSL_ERROR_ZERO_RETURN:
             break;
+        case SSL_ERROR_SYSCALL:
+            con->error = 1;
+            DEBUG3("syscall error %d, on %s (%" PRIu64 ")", sock_error(), &con->ip[0], con->id);
+            // fallthru
         case SSL_ERROR_WANT_READ:
         case SSL_ERROR_WANT_WRITE:
             return -1;
@@ -936,6 +957,7 @@ static sock_t wait_for_serversock (void)
         {
             ERROR0 ("signalfd descriptor became invalid, doing thread restart");
             slave_restart(); // something odd happened
+            thread_sleep (250000);
         }
 #endif
         for(i=0; i < global.server_sockets; i++) {
@@ -946,8 +968,9 @@ static sock_t wait_for_serversock (void)
                 if (ufds[i].revents & (POLLHUP|POLLERR))
                 {
                     sock_close (global.serversock[i]);
-                    WARN0("Had to close a listening socket");
                 }
+                listener_t *l = global.server_conn[i];
+                WARN2("Had to remove a listening socket on port %d (%s)", l->port, l->bind_address ? l->bind_address : "default");
                 global.serversock[i] = SOCK_ERROR;
             }
         }
@@ -1000,8 +1023,8 @@ static sock_t wait_for_serversock (void)
 
 static client_t *accept_client (void)
 {
-    client_t *client = NULL;
     sock_t sock, serversock = wait_for_serversock ();
+    listener_t *server_conn = NULL;
     char addr [200];
 
     if (serversock == SOCK_ERROR)
@@ -1028,37 +1051,66 @@ static client_t *accept_client (void)
             WARN0 ("failed to set tcp options on client connection, dropping");
             break;
         }
-        client = calloc (1, sizeof (client_t));
-        if (client == NULL || connection_init (&client->connection, sock, addr) < 0)
-            break;
-
-        client->shared_data = r = refbuf_new (PER_CLIENT_REFBUF_SIZE);
-        r->len = 0; // for building up the request coming in
-
         global_lock ();
-        client_register (client);
-
         for (i=0; i < global.server_sockets; i++)
         {
             if (global.serversock[i] == serversock)
             {
-                client->server_conn = global.server_conn[i];
-                client->server_conn->refcount++;
-                if (client->server_conn->ssl && ssl_ok)
-                    connection_uses_ssl (&client->connection);
-                if (client->server_conn->shoutcast_compat)
-                    client->ops = &shoutcast_source_ops;
-                else
-                    client->ops = &http_request_ops;
+                server_conn = global.server_conn[i];
+                server_conn->refcount++;
                 break;
             }
         }
         global_unlock ();
-        client->flags |= CLIENT_ACTIVE;
-        return client;
+        if (server_conn)
+        {
+            client_t *client = NULL;
+            int not_using_ssl = 1;
+
+            if (ssl_ok && server_conn->ssl)
+                not_using_ssl = 0;
+            if (not_using_ssl)
+            {
+                if (sock_set_blocking (sock, 0) || (sock_set_cork (sock, 1) < 0 && sock_set_nodelay (sock)))
+                {
+                    WARN1 ("failed to set tcp options on incoming client connection %s, dropping", addr);
+                    break;
+                }
+            }
+            client = calloc (1, sizeof (client_t));
+            if (client == NULL || connection_init (&client->connection, sock, addr) < 0)
+            {
+                free (client);
+                break;
+            }
+
+            client->shared_data = r = refbuf_new (PER_CLIENT_REFBUF_SIZE);
+            r->len = 0; // for building up the request coming in
+
+            global_lock ();
+            client_register (client);
+            global_unlock ();
+
+            if (not_using_ssl == 0)
+                connection_uses_ssl (&client->connection);
+
+            if (server_conn->shoutcast_compat)
+                client->ops = &shoutcast_source_ops;
+            else
+                client->ops = &http_request_ops;
+            client->server_conn = server_conn;
+            client->flags |= CLIENT_ACTIVE;
+
+            return client;
+        }
     } while (0);
 
-    free (client);
+    if (server_conn)
+    {
+        global_lock ();
+        server_conn->refcount--;
+        global_unlock ();
+    }
     sock_close (sock);
     return NULL;
 }
@@ -1604,6 +1656,7 @@ static int _handle_source_request (client_t *client)
     config = config_get_config();
     _check_for_x_forwarded_for(config, client);
     config_release_config();
+    client->flags &= ~CLIENT_KEEPALIVE;
     
     if (uri[0] != '/')
     {
@@ -1652,7 +1705,8 @@ static void check_for_filtering (ice_config_t *config, client_t *client, char *u
         (type && (strcmp (type, ".flv") == 0 || strcmp (type, ".fla") == 0)))
     {
         client->flags |= CLIENT_WANTS_FLV;
-        DEBUG0 ("listener has requested FLV");
+        client->flags &= ~CLIENT_KEEPALIVE;
+        DEBUG1 ("listener at %s has requested FLV", &client->connection.ip[0]);
     }
     if (extension == NULL || uri == NULL)
         return;
@@ -1806,7 +1860,7 @@ void connection_listen_sockets_close (ice_config_t *config, int all_sockets)
 int connection_setup_sockets (ice_config_t *config)
 {
     static int sockets_setup = 2;
-    int count = 0, socket_count = 0, arr_size;
+    int count = 0, socket_count = 0, socket_attempt = 0, arr_size;
     listener_t *listener, **prev;
 
     global_lock();
@@ -1814,31 +1868,34 @@ int connection_setup_sockets (ice_config_t *config)
     listener = config->listen_sock;
     prev = &config->listen_sock;
     arr_size = count = global.server_sockets;
-    if (config->chuid && sockets_setup)
+    if (sockets_setup == 1)
     {
         // in case of changowner, run through the first time as root, but reject the second run through as that will 
-        // be as a user. after that it's fine.
+        // be as a user (initial startup of listening thread). after that it's fine.
         sockets_setup--;
-        if (sockets_setup == 0)
-        {
-            global_unlock();
-            return 0;
-        }
+        global_unlock();
+        return 0;
     }
+    if (sockets_setup > 0)
+        sockets_setup--;
     get_ssl_certificate (config);
     if (count)
         INFO1 ("%d listening sockets already open", count);
     while (listener)
     {
         socket_count = 0;
+        socket_attempt = 0;
 
         sock_server_t sockets = sock_get_server_sockets (listener->port, listener->bind_address);
 
         do
         {
-            sock_t sock = sock_get_next_server_socket (sockets);
+            sock_t sock = SOCK_ERROR;
+            if (sock_get_next_server_socket (sockets, &sock) < 0)
+                break;   // end of any available sockets
+            socket_attempt++;
             if (sock == SOCK_ERROR)
-                break;
+                continue;
             /* some win32 setups do not do TCP win scaling well, so allow an override */
             if (listener->so_sndbuf)
                 sock_set_send_buffer (sock, listener->so_sndbuf);
@@ -1847,7 +1904,7 @@ int connection_setup_sockets (ice_config_t *config)
             if (sock_listen (sock, listener->qlen) == SOCK_ERROR)
             {
                 sock_close (sock);
-                break;
+                continue;
             }
             if (count >= arr_size) // need to resize arrays?
             {
@@ -1869,13 +1926,22 @@ int connection_setup_sockets (ice_config_t *config)
         } while(1);
 
         sock_free_server_sockets (sockets);
-        if (socket_count == 0)
+        if (socket_count != socket_attempt)
         {
-            if (listener->bind_address)
-                ERROR2 ("Could not create listener socket on port %d bind %s",
-                        listener->port, listener->bind_address);
-            else
-                ERROR1 ("Could not create listener socket on port %d", listener->port);
+            if (socket_count == 0)
+            {
+                if (listener->bind_address)
+                    ERROR2 ("Could not create listener socket on port %d bind %s",
+                            listener->port, listener->bind_address);
+                else
+                    ERROR1 ("Could not create listener socket on port %d", listener->port);
+            }
+            if (sockets_setup)
+            {
+                global_unlock();
+                ERROR0 ("unable to setup all listening sockets");
+                return 0;
+            }
             /* remove failed connection */
             *prev = config_clear_listener (listener);
             listener = *prev;
@@ -1899,6 +1965,16 @@ int connection_setup_sockets (ice_config_t *config)
     return count;
 }
 
+
+void connection_reset (connection_t *con, uint64_t time_ms)
+{
+    con->con_time = time_ms/1000;
+    con->discon.time = con->con_time + 7;
+    con->sent_bytes = 0;
+#ifdef HAVE_OPENSSL
+    if (con->ssl) { SSL_shutdown (con->ssl); SSL_free (con->ssl); con->ssl = NULL; }
+#endif
+}
 
 void connection_close(connection_t *con)
 {

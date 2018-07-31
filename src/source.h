@@ -38,7 +38,10 @@ typedef struct source_tag
     avl_tree *clients;
 
     /* name of a file, whose contents are sent at listener connection */
+    char *intro_filename;
     icefile_handle intro_file;
+    long intro_start;
+    int preroll_log_id;
 
     char *dumpfilename; /* Name of a file to dump incoming stream to */
     FILE *dumpfile;
@@ -73,9 +76,12 @@ typedef struct source_tag
     uint64_t shrink_pos;
     uint64_t shrink_time;
 
+    unsigned buffer_count;
     unsigned timeout;  /* source timeout in seconds */
-    unsigned long bytes_sent_since_update;
-    unsigned long bytes_read_since_update;
+    uint64_t bytes_sent_at_update;
+    uint64_t bytes_read_since_update;
+
+    int intro_skip_replay;
     int stats_interval;
     long stats;
 
@@ -86,6 +92,7 @@ typedef struct source_tag
 
     util_dict *audio_info;
 
+    cache_file_contents *intro_ipcache;
 } source_t;
 
 #define SOURCE_RUNNING              1
@@ -119,6 +126,7 @@ void source_setup_listener (source_t *source, client_t *client);
 void source_init (source_t *source);
 void source_shutdown (source_t *source, int with_fallback);
 void source_set_fallback (source_t *source, const char *dest_mount);
+int source_set_intro (source_t *source, const char *file_pattern);
 int  source_format_init (source_t *source);
 void source_listeners_wakeup (source_t *source);
 

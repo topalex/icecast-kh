@@ -78,6 +78,8 @@ typedef struct playlist_log
     unsigned duration;
 } playlist_log;
 
+typedef struct error_log preroll_log;
+
 
 typedef struct ice_config_dir_tag
 {
@@ -136,6 +138,7 @@ typedef struct _mount_proxy {
     int ogg_passthrough; /* enable to prevent the ogg stream being rebuilt */
     int admin_comments_only; /* enable to only show comments set from the admin page */
     int skip_accesslog;         /* skip logging client to access log */
+    int intro_skip_replay;      /* duration to cache IPs, for intro playing */
 
     int64_t limit_rate;
 
@@ -152,6 +155,7 @@ typedef struct _mount_proxy {
     unsigned int max_listener_duration;
 
     struct access_log      access_log;
+    preroll_log     preroll_log;
 
     char *redirect;
     char *stream_name;
@@ -260,6 +264,7 @@ typedef struct ice_config_tag
     int source_timeout;
     int ice_login;
     int64_t max_bandwidth;
+    int max_listeners;
     int fileserve;
     int on_demand; /* global setting for all relays */
 
@@ -299,6 +304,7 @@ typedef struct ice_config_tag
     relay_server *relays;
 
     mount_proxy *mounts;
+    avl_tree *mounts_tree;
 
     char *server_id;
     char *base_dir;
@@ -309,6 +315,7 @@ typedef struct ice_config_tag
     char *agentfile;
     char *cert_file;
     char *key_file;
+    char *ca_file;
     char *cipher_list;
     char *webroot_dir;
     char *adminroot_dir;
@@ -318,6 +325,7 @@ typedef struct ice_config_tag
     struct access_log      access_log;
     struct error_log       error_log;
     struct playlist_log    playlist_log;
+    preroll_log     preroll_log;
 
     int chroot;
     int chuid;

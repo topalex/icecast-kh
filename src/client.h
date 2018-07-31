@@ -93,7 +93,7 @@ struct _client_tag
     listener_t *server_conn;
 
     /* is client getting intro data */
-    long intro_offset;
+    off_t intro_offset;
 
     /* where in the queue the client is */
     refbuf_t *refbuf;
@@ -115,6 +115,7 @@ struct _client_tag
 
     uint64_t timer_start;
     uint64_t counter;
+    uint64_t aux_data;
 
     /* function to call to release format specific resources */
     void (*free_client_data)(struct _client_tag *client);
@@ -151,7 +152,8 @@ void worker_balance_trigger (time_t now);
 void workers_adjust (int new_count);
 void worker_wakeup (worker_t *worker);
 void worker_logger_init (void);
-void worker_logger (void);
+void worker_logger (int stop);
+int  is_worker_incoming (worker_t *w);
 
 
 /* client flags bitmask */

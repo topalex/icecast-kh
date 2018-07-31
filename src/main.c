@@ -118,10 +118,7 @@ void shutdown_subsystems(void)
 {
     connection_shutdown();
     slave_shutdown();
-    fserve_shutdown();
-    stats_shutdown();
     xslt_shutdown();
-    stop_logging();
 
     config_shutdown();
     refbuf_shutdown();
@@ -134,8 +131,8 @@ void shutdown_subsystems(void)
 
     /* Now that these are done, we can stop the loggers. */
     log_shutdown();
-    thread_shutdown();
     global_shutdown();
+    thread_shutdown();
 }
 
 static int _parse_config_opts(int argc, char **argv, char *filename, int size)
@@ -199,7 +196,7 @@ static int server_proc_init(void)
 
     INFO2 ("%s server reading configuration from %s", ICECAST_VERSION_STRING, config->config_filename);
 
-    if (config->chuid && connection_setup_sockets (config) == 0)
+    if (connection_setup_sockets (config) == 0)
         return 0;
 
     _ch_root_uid_setup(); /* Change user id and root if requested/possible */

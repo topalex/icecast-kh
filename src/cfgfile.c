@@ -22,7 +22,7 @@
 #if HAVE_GLOB_H
 #include <glob.h>
 #endif
-
+#include <errno.h>
 #include <fnmatch.h>
 #include "thread/thread.h"
 #include "cfgfile.h"
@@ -116,6 +116,7 @@ int config_get_bool (xmlNodePtr node, void *x)
                 *(int*)x = 1;
             else
                 *(int*)x = (strtol (str, NULL, 0)==0) ? 0 : 1;
+        errno = 0;
         xmlFree (str);
     }
     return 0;
@@ -144,6 +145,7 @@ int config_get_int (xmlNodePtr node, void *x)
         if (str == NULL)
             return 1;
         *(int*)x = (int)strtol ((char*)str, NULL, 0);
+        errno = 0;
         xmlFree (str);
     }
     return 0;
@@ -158,6 +160,7 @@ int config_get_long (xmlNodePtr node, void *x)
         if (str == NULL)
             return 1;
         *(long*)x = strtol ((char*)str, NULL, 0);
+        errno = 0;
         xmlFree (str);
     }
     return 0;
@@ -297,6 +300,13 @@ relay_server *config_clear_relay (relay_server *relay)
 }
 
 
+int config_mount_template (const char *mount)
+{
+    int len = strcspn (mount, "*?[$");
+    return (mount[len]) ? 1 : 0;
+}
+
+
 static void config_clear_mount (mount_proxy *mount)
 {
     config_options_t *option;
@@ -334,12 +344,20 @@ static void config_clear_mount (mount_proxy *mount)
         thread_mutex_lock (&mount->auth->lock);
         auth_release (mount->auth);
     }
+    xmlFree (mount->preroll_log.name);
     if (mount->access_log.logid >= 0)
         log_close (mount->access_log.logid);
     xmlFree (mount->access_log.name);
     xmlFree (mount->access_log.exclude_ext);
     xmlFree (mount->mountname);
     free (mount);
+}
+
+// helper routine for avl/cleanup
+static int config_clear_mount_from_tree (void *arg)
+{
+    config_clear_mount ((mount_proxy *)arg);
+    return 1;
 }
 
 listener_t *config_clear_listener (listener_t *listener)
@@ -387,6 +405,7 @@ void config_clear(ice_config_t *c)
     if (c->banfile) xmlFree(c->banfile);
     if (c->allowfile) xmlFree (c->allowfile);
     if (c->agentfile) xmlFree (c->agentfile);
+    if (c->preroll_log.name) xmlFree(c->preroll_log.name);
     if (c->playlist_log.name) xmlFree(c->playlist_log.name);
     if (c->access_log.name) xmlFree(c->access_log.name);
     if (c->error_log.name) xmlFree(c->error_log.name);
@@ -419,6 +438,7 @@ void config_clear(ice_config_t *c)
     while (c->redirect_hosts)
         c->redirect_hosts = config_clear_redirect (c->redirect_hosts);
 
+    avl_tree_free (c->mounts_tree, config_clear_mount_from_tree);
     while (c->mounts)
     {
         mount_proxy *to_go = c->mounts;
@@ -538,6 +558,16 @@ ice_config_t *config_get_config_unlocked(void)
     return &_current_configuration;
 }
 
+
+static int compare_mounts (void *arg, void *a, void *b)
+{
+    mount_proxy *m1 = (mount_proxy *)a;
+    mount_proxy *m2 = (mount_proxy *)b;
+
+    return strcmp (m1->mountname, m2->mountname);
+}
+
+
 static void _set_defaults(ice_config_t *configuration)
 {
     configuration->location = (char *)xmlCharStrdup (CONFIG_DEFAULT_LOCATION);
@@ -589,6 +619,7 @@ static void _set_defaults(ice_config_t *configuration)
     /* default to a typical prebuffer size used by clients */
     configuration->min_queue_size = 0;
     configuration->burst_size = CONFIG_DEFAULT_BURST_SIZE;
+    configuration->mounts_tree = avl_tree_new (compare_mounts, NULL);
 }
 
 
@@ -744,6 +775,7 @@ static int _parse_logging (xmlNodePtr node, void *arg)
     int old_archive = -1;
     struct cfg_tag icecast_tags[] =
     {
+        { "preroll-log",    _parse_errorlog,    &config->preroll_log },
         { "accesslog",      _parse_accesslog,   &config->access_log },
         { "playlistlog",    _parse_playlistlog, &config->playlist_log },
         { "accesslog",      config_get_str,     &config->access_log.name },
@@ -764,6 +796,9 @@ static int _parse_logging (xmlNodePtr node, void *arg)
         { NULL, NULL, NULL }
     };
 
+    config->preroll_log.logid = -1;
+    config->preroll_log.display = 50;
+    config->preroll_log.archive = -1;
     config->access_log.type = LOG_ACCESS_CLF;
     config->access_log.logid = -1;
     config->access_log.display = 100;
@@ -893,6 +928,7 @@ static int _parse_paths (xmlNodePtr node, void *arg)
         { "deny-agents",    config_get_str, &config->agentfile },
         { "ssl-private-key",        config_get_str, &config->key_file },
         { "ssl-certificate",        config_get_str, &config->cert_file },
+        { "ssl-cafile",             config_get_str, &config->ca_file },
         { "ssl_certificate",        config_get_str, &config->cert_file },
         { "ssl-allowed-ciphers",    config_get_str, &config->cipher_list },
         { "webroot",        config_get_str, &config->webroot_dir },
@@ -984,6 +1020,7 @@ static int _parse_mount (xmlNodePtr node, void *arg)
                                 config_get_bool,    &mount->url_ogg_meta },
         { "no-mount",           config_get_bool,    &mount->no_mount },
         { "ban-client",         config_get_int,     &mount->ban_client },
+        { "intro-skip-replay",  config_get_int,     &mount->intro_skip_replay },
         { "so-sndbuf",          config_get_int,     &mount->so_sndbuf },
         { "hidden",             config_get_bool,    &mount->hidden },
         { "authentication",     auth_get_authenticator, &mount->auth },
@@ -993,6 +1030,7 @@ static int _parse_mount (xmlNodePtr node, void *arg)
                                 config_get_int,     &mount->max_stream_duration },
         { "max-listener-duration",
                                 config_get_int,     &mount->max_listener_duration },
+        { "preroll-log",        _parse_errorlog,    &mount->preroll_log },
         { "accesslog",          _parse_accesslog,   &mount->access_log },
         /* YP settings */
         { "cluster-password",   config_get_str,     &mount->cluster_password },
@@ -1022,6 +1060,9 @@ static int _parse_mount (xmlNodePtr node, void *arg)
     mount->access_log.log_ip = 1;
     mount->fallback_override = 1;
     mount->max_send_size = 0;
+    mount->preroll_log.logid = -1;
+    mount->preroll_log.display = 50;
+    mount->preroll_log.archive = -1;
 
     if (parse_xml_tags (node, icecast_tags))
         return -1;
@@ -1060,8 +1101,14 @@ static int _parse_mount (xmlNodePtr node, void *arg)
         mount->fallback_mount = NULL;
     }
 
-    mount->next = config->mounts;
-    config->mounts = mount;
+    if (config_mount_template (mount->mountname))
+    {
+        // may need some priority order imposed at some point
+        mount->next = config->mounts;
+        config->mounts = mount;
+    }
+    else
+        avl_insert (config->mounts_tree, mount);
 
     return 0;
 }
@@ -1209,6 +1256,7 @@ static int _parse_limits (xmlNodePtr node, void *arg)
     struct cfg_tag icecast_tags[] =
     {
         { "max-bandwidth",  config_get_bitrate,&config->max_bandwidth },
+        { "max-listeners",  config_get_int,    &config->max_listeners },
         { "clients",        config_get_int,    &config->client_limit },
         { "sources",        config_get_int,    &config->source_limit },
         { "queue-size",     config_get_int,    &config->queue_size_limit },
@@ -1394,21 +1442,31 @@ static int _parse_root (xmlNodePtr node, ice_config_t *config)
 /* return the mount details that match the supplied mountpoint */
 mount_proxy *config_find_mount (ice_config_t *config, const char *mount)
 {
-    mount_proxy *mountinfo = config->mounts, *to_return = NULL;
-
     if (mount == NULL)
     {
         WARN0 ("no mount name provided");
         return NULL;
     }
-    while (mountinfo)
+    void *result;
+    mount_proxy findit, *mountinfo = NULL;
+    findit.mountname = (char *)mount;
+
+    int missing = avl_get_by_key (config->mounts_tree, &findit, &result);
+    if (missing)
     {
-        if (fnmatch (mountinfo->mountname, mount, 0) == 0)
-            to_return = mountinfo;
-        mountinfo = mountinfo->next;
+        mount_proxy *to_return = NULL;
+        mountinfo = config->mounts;
+        while (mountinfo)
+        {
+            if (fnmatch (mountinfo->mountname, mount, 0) == 0)
+                to_return = mountinfo;
+            mountinfo = mountinfo->next;
+        }
+        if (mountinfo == NULL)
+            mountinfo = to_return;
     }
-    if (mountinfo == NULL)
-        mountinfo = to_return;
+    else
+        mountinfo = result;
     return mountinfo;
 }
 

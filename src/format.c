@@ -145,6 +145,40 @@ int format_get_plugin (format_plugin_t *plugin)
 }
 
 
+int format_check_frames (struct format_check_t *c)
+{
+    int ret = -1;
+    refbuf_t *r = refbuf_new (16384);
+    mpeg_sync sync;
+    mpeg_setup (&sync, c->desc);
+    mpeg_check_numframes (&sync, 20);
+
+    do
+    {
+        int bytes = pread (c->fd, r->data, 16384, 0);
+        if (bytes <= 0)
+            break;
+
+        r->len = bytes;
+        int unprocessed = mpeg_complete_frames (&sync, r, 0);
+        if (r->len == 0)
+        {
+            break;
+        }
+        c->offset = bytes - (r->len + unprocessed);
+        c->type = mpeg_get_type (&sync);
+        c->srate = mpeg_get_samplerate (&sync);
+        c->channels = mpeg_get_channels (&sync);
+        c->bitrate = mpeg_get_bitrate (&sync);
+        ret = 0;
+    } while (0);
+    refbuf_release (r);
+    mpeg_cleanup (&sync);
+
+    return ret;
+}
+
+
 int format_file_read (client_t *client, format_plugin_t *plugin, icefile_handle f)
 {
     refbuf_t *refbuf = client->refbuf;
@@ -159,7 +193,6 @@ int format_file_read (client_t *client, format_plugin_t *plugin, icefile_handle 
             if (file_in_use (f) == 0)
                 return -2;
             refbuf = client->refbuf = refbuf_new (len);
-            client->flags |= CLIENT_HAS_INTRO_CONTENT;
             client->pos = refbuf->len;
             client->queue_pos = 0;
             refbuf->flags |= BUFFER_LOCAL_USE;
@@ -192,9 +225,12 @@ int format_file_read (client_t *client, format_plugin_t *plugin, icefile_handle 
                 DEBUG1 ("End of requested range (%" PRId64 ")", client->connection.discon.offset);
                 return -1;
             }
-            range = client->connection.discon.offset - client->intro_offset + 1;
-            if (range < len)
-                len = range;
+            if (client->connection.discon.offset < (uint64_t)-1)
+            {
+                range = client->connection.discon.offset - client->intro_offset + 1;
+                if (range && range < len)
+                    len = range;
+            }
         }
         else
             if (client->connection.discon.time && client->worker->current_time.tv_sec >= client->connection.discon.time)
@@ -202,8 +238,10 @@ int format_file_read (client_t *client, format_plugin_t *plugin, icefile_handle 
 
         bytes = pread (f, refbuf->data, len, client->intro_offset);
         if (bytes <= 0)
+        {
+            client->flags &= ~CLIENT_HAS_INTRO_CONTENT;
             return bytes < 0 ? -2 : -1;
-
+        }
         refbuf->len = bytes;
         client->pos = 0;
         if (plugin && plugin->align_buffer)
@@ -349,7 +387,7 @@ int format_general_headers (format_plugin_t *plugin, client_t *client)
 
             if (client->intro_offset > client->connection.discon.offset)
             {
-                DEBUG2 ("client range invalid (%ld, %" PRIu64 ")", client->intro_offset, client->connection.discon.offset);
+                DEBUG2 ("client range invalid (%ld, %" PRIu64 ")", (long)client->intro_offset, client->connection.discon.offset);
                 return -1;
             }
             uint64_t len = client->connection.discon.offset - client->intro_offset + 1;
@@ -400,7 +438,13 @@ int format_general_headers (format_plugin_t *plugin, client_t *client)
             struct tm result;
 
             if (gmtime_r (&client->worker->current_time.tv_sec, &result))
-                strftime (datebuf, sizeof(datebuf), "Date: %a, %d %b %Y %X GMT\r\n", &result);
+            {
+                if (strftime (datebuf, sizeof(datebuf), "Date: %a, %d %b %Y %X GMT\r\n", &result) == 0)
+                {
+                    datebuf[0] = '\0';
+                    sock_set_error (0);
+                }
+            }
 
             if (contenttype == NULL)
                 contenttype = "application/octet-stream";

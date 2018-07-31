@@ -41,11 +41,13 @@ void global_initialize(void)
     global.alloc_tree = avl_tree_new(compare_allocs, NULL);
 #endif
     thread_mutex_create(&_global_mutex);
+    thread_rwlock_create(&global.workers_rw);
     global.out_bitrate = rate_setup (20000, 1000);
 }
 
 void global_shutdown(void)
 {
+    thread_rwlock_destroy(&global.workers_rw);
     thread_mutex_destroy(&_global_mutex);
     avl_tree_free(global.source_tree, NULL);
     rate_free (global.out_bitrate);
@@ -72,7 +74,7 @@ void global_add_bitrates (struct rate_calc *rate, unsigned long value, uint64_t 
 
 void global_reduce_bitrate_sampling (struct rate_calc *rate)
 {
-    rate_reduce (rate, 500);
+    rate_reduce (rate, 2000);
 }
 
 unsigned long global_getrate_avg (struct rate_calc *rate)

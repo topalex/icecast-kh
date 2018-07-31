@@ -100,8 +100,10 @@ struct tm *gmtime_r(const time_t *timep, struct tm *result);
 char *util_conv_string (const char *string, const char *in_charset, const char *out_charset);
 
 struct rate_calc *rate_setup (unsigned int samples, unsigned int ssec);
-void rate_add (struct rate_calc *calc, long value, uint64_t t);
+void rate_add_sum (struct rate_calc *calc, long value, uint64_t t, uint64_t *sum);
+#define rate_add(A,B,C)   rate_add_sum((A),(B),(C), NULL);
 long rate_avg (struct rate_calc *calc);
+long rate_avg_shorten (struct rate_calc *calc, unsigned int t);
 void rate_free (struct rate_calc *calc);
 void rate_reduce (struct rate_calc *calc, unsigned int range);
 
@@ -116,6 +118,7 @@ int cached_pattern_compare (const char *value, const char *pattern);
 void cached_file_clear (cache_file_contents *cache);
 int cached_pattern_search (cache_file_contents *cache, const char *line, time_t now);
 void cached_file_recheck (cache_file_contents *cache, time_t now);
+void cached_prune (cache_file_contents *cache);
 
 
 #endif  /* __UTIL_H__ */

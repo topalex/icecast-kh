@@ -63,6 +63,7 @@ struct rate_calc_node
 struct rate_calc
 {
     int64_t total;
+    uint64_t cycle_till;
     struct rate_calc_node *current;
     spin_t lock;
     unsigned int samples;
@@ -799,18 +800,35 @@ static void rate_purge_entries (struct rate_calc *calc, uint64_t cutoff)
 /* add a value to sampled data, t is used to determine which sample
  * block the sample goes into.
  */
-void rate_add (struct rate_calc *calc, long value, uint64_t sid) 
+void rate_add_sum (struct rate_calc *calc, long value, uint64_t sid, uint64_t *sum)
 {
     uint64_t cutoff;
 
     thread_spin_lock (&calc->lock);
     cutoff = sid - calc->samples;
+    if (calc->cycle_till)
+    {
+        do {
+            if (calc->current)
+            {
+                struct rate_calc_node *next = calc->current->next;
+                if (next->index < calc->cycle_till)
+                {
+                    cutoff = next->index + 1;
+                    break;
+                }
+            }
+            calc->cycle_till = 0;
+        } while (0);
+    }
     if (value == 0 && calc->current && calc->current->value == 0)
     {
         calc->current->index = sid; /* update the timestamp if 0 already present */
         rate_purge_entries (calc, cutoff);
         return;
     }
+    if (sum)
+        *sum += value;
     while (1)
     {
         struct rate_calc_node *next = NULL, *node;
@@ -851,7 +869,13 @@ void rate_add (struct rate_calc *calc, long value, uint64_t sid)
             calc->current = node;
             calc->blocks++;
         }
-        calc->current->value += value;
+        else
+        {
+            calc->current = next;
+            calc->total -= next->value;
+            next->index = sid;
+        }
+        calc->current->value = value;
         break;
     }
     calc->total += value;
@@ -860,9 +884,9 @@ void rate_add (struct rate_calc *calc, long value, uint64_t sid)
 
 
 /* return the average sample value over all the blocks except the 
- * current one, as that may be incomplete
+ * current one, as that may be incomplete. t to reduce the duration
  */
-long rate_avg (struct rate_calc *calc)
+long rate_avg_shorten (struct rate_calc *calc, unsigned int t)
 {
     long total = 0, ssec = 1;
     float range = 1.0;
@@ -872,16 +896,21 @@ long rate_avg (struct rate_calc *calc)
     thread_spin_lock (&calc->lock);
     if (calc && calc->blocks > 1)
     {
-        range = (float)(calc->current->index - calc->current->next->index) + 1;
+        range = (float)(calc->current->index - calc->current->next->index);
         if (range < 1)
             range = 1;
         total = calc->total;
-        ssec = calc->ssec;
+        if (t < calc->ssec)
+            ssec = calc->ssec - t;
     }
     thread_spin_unlock (&calc->lock);
     return (long)(total / range * ssec);
 }
 
+long rate_avg (struct rate_calc *calc)
+{
+    return rate_avg_shorten (calc, 0);
+}
 
 /* reduce the samples used to calculate average */
 void rate_reduce (struct rate_calc *calc, unsigned int range)
@@ -890,7 +919,10 @@ void rate_reduce (struct rate_calc *calc, unsigned int range)
         return;
     thread_spin_lock (&calc->lock);
     if (range && calc->blocks > 1)
+    {
+        calc->cycle_till = calc->current->index;
         rate_purge_entries (calc, calc->current->index - range);
+    }
     else
         thread_spin_unlock (&calc->lock);
 }
@@ -989,7 +1021,7 @@ int cached_treenode_free (void*x)
 }
 
 
-void cachefile_prune (cache_file_contents *cache)
+void cached_prune (cache_file_contents *cache)
 {
     if (cache == NULL)
         return;
@@ -1030,7 +1062,7 @@ void cached_file_recheck (cache_file_contents *cache, time_t now)
 
         if (cache->filename == NULL)
         {
-            cachefile_prune (cache);
+            cached_prune (cache);
             break;
         }
         if (stat (cache->filename, &file_stat) < 0)
@@ -1050,7 +1082,7 @@ void cached_file_recheck (cache_file_contents *cache, time_t now)
             break;
         }
 
-        cachefile_prune (cache);
+        cached_prune (cache);
         cache->contents = avl_tree_new (cache->compare, &cache->file_recheck);
         while (get_line (file, line, MAX_LINE_LEN))
         {
@@ -1105,7 +1137,7 @@ void cached_file_clear (cache_file_contents *cache)
 {
     if (cache == NULL)
         return;
-    cachefile_prune (cache);
+    cached_prune (cache);
     free (cache->filename);
     memset (cache, 0, sizeof (*cache));
 }
@@ -1184,7 +1216,9 @@ int util_get_clf_time (char *buffer, unsigned len, time_t now)
     snprintf (timezone_string, sizeof (timezone_string),
             "%%d/%%b/%%Y:%%H:%%M:%%S %c%.2d%.2d", sign, time_tz / 60, time_tz % 60);
 
-    return strftime (buffer, len, timezone_string, &thetime);
+    int r = strftime (buffer, len, timezone_string, &thetime);
+    if (r) errno = 0;
+    return r;
 }
 #else
 
@@ -1192,7 +1226,9 @@ int util_get_clf_time (char *buffer, unsigned len, time_t now)
 {
     struct tm thetime;
     localtime_r (&now, &thetime);
-    return strftime (buffer, len, "%d/%b/%Y:%H:%M:%S %z", &thetime);
+    int r = strftime (buffer, len, "%d/%b/%Y:%H:%M:%S %z", &thetime);
+    if (r) errno = 0;
+    return r;
 }
 
 #endif

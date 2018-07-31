@@ -102,6 +102,7 @@ typedef struct {
     icefile_handle f;
     time_t stats_update;
     time_t expire;
+    long frame_start_pos;
     stats_handle_t stats;
     format_plugin_t *format;
     struct rate_calc *out_bitrate;
@@ -414,6 +415,20 @@ static fh_node *open_fh (fbinfo *finfo)
                 free (fh);
                 return NULL;
             }
+            format_check_t fcheck;
+            fcheck.fd = fh->f;
+            fcheck.desc = finfo->mount;
+            if (format_check_frames (&fcheck) < 0 || fcheck.type == FORMAT_TYPE_UNDEFINED)
+                WARN1 ("different type detected for %s", finfo->mount);
+            else
+            {
+                if (fh->finfo.limit && fcheck.bitrate > 0)
+                {
+                    float ratio = (float)fh->finfo.limit / (fcheck.bitrate/8);
+                    if (ratio < 0.9 || ratio > 1.1)
+                        WARN3 ("bitrate from %s (%d), was expecting %d", finfo->mount, (fcheck.bitrate/1000), (fh->finfo.limit/1000*8));
+                }
+            }
         }
         if (fh->finfo.limit)
             fh->out_bitrate = rate_setup (10000, 1000);
@@ -594,7 +609,13 @@ static void file_release (client_t *client)
     int ret = -1;
 
     if (fh->finfo.limit && (client->flags & CLIENT_AUTHENTICATED))
+    {
+        // reduce from global count
         stats_event_dec (NULL, "listeners");
+        global_lock();
+        global.listeners--;
+        global_unlock();
+    }
 
     client_set_queue (client, NULL);
 
@@ -695,7 +716,7 @@ static int fserve_change_worker (client_t *client)
     if (worker && worker != client->worker)
     {
         long diff = this_worker->move_allocations < 1000000 ? this_worker->count - worker->count : 1000;
-        if (diff > 15)
+        if (diff > 10)
         {
             this_worker->move_allocations--;
             ret = client_change_worker (client, worker);
@@ -736,6 +757,7 @@ static int prefile_send (client_t *client)
                     refbuf_release (client->refbuf);
                     client->refbuf = NULL;
                     client->pos = 0;
+                    client->intro_offset = fh->frame_start_pos;
                     if (fh->finfo.limit)
                     {
                         client->ops = &throttled_file_content_ops;
@@ -983,6 +1005,7 @@ int fserve_setup_client_fb (client_t *client, fbinfo *finfo)
     if (ret < 0)
     {
         thread_mutex_unlock (&fh->lock);
+        client->mount = NULL;
         return client_send_416 (client);
     }
     fh_add_client (fh, client);
@@ -1128,6 +1151,7 @@ void fserve_recheck_mime_types (ice_config_t *config)
         { "pls",            "audio/x-scpls" },
         { "xspf",           "application/xspf+xml" },
         { "ogg",            "application/ogg" },
+        { "xml",            "text/xml" },
         { "mp3",            "audio/mpeg" },
         { "aac",            "audio/aac" },
         { "aacp",           "audio/aacp" },

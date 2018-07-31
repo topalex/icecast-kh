@@ -26,6 +26,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <fcntl.h>
+#include <errno.h>
 
 #include "thread/thread.h"
 #include "avl/avl.h"
@@ -132,7 +133,8 @@ void client_destroy(client_t *client)
     client->respcode = 0;
     client->free_client_data = NULL;
 
-    sock_set_cork (client->connection.sock, 0); // ensure any corked data is actually sent.
+    if (not_ssl_connection (&client->connection))
+        sock_set_cork (client->connection.sock, 0); // ensure any corked data is actually sent.
 
     global_lock ();
     if (global.running != ICE_RUNNING || client->connection.error ||
@@ -147,17 +149,18 @@ void client_destroy(client_t *client)
         return;
     }
     global_unlock ();
-    DEBUG0 ("keepalive detected, placing back onto worker");
-    sock_set_cork (client->connection.sock, 1);    // reenable cork for the next go around
+    DEBUG1 ("keepalive detected on %s, placing back onto worker", client->connection.ip);
+    if (not_ssl_connection (&client->connection))
+        sock_set_cork (client->connection.sock, 1);    // reenable cork for the next go around
     client->counter = client->schedule_ms = timing_get_time();
-    client->connection.con_time = client->schedule_ms/1000;
-    client->connection.discon.time = client->connection.con_time + 7;
+    connection_reset (&client->connection, client->schedule_ms);
+
     client->ops = &http_request_ops;
     client->flags = CLIENT_ACTIVE;
     client->shared_data = NULL;
     client->refbuf = NULL;
     client->pos = 0;
-    client->intro_offset = client->connection.sent_bytes = 0;
+    client->intro_offset = 0;
     client_add_incoming (client);
 }
 
@@ -199,7 +202,7 @@ int client_read_bytes (client_t *client, void *buf, unsigned len)
     bytes = con_read (&client->connection, buf, len);
 
     if (bytes == -1 && client->connection.error)
-        DEBUG0 ("reading from connection has failed");
+        DEBUG2 ("reading from connection %"PRIu64 " from %s has failed", client->connection.id, &client->connection.ip[0]);
 
     return bytes;
 }
@@ -297,7 +300,7 @@ int client_send_404 (client_t *client, const char *message)
         return 0;
     }
     client_set_queue (client, NULL);
-    if (client->respcode)
+    if (client->respcode || client->connection.error)
     {
         worker_t *worker = client->worker;
         if (client->respcode >= 300)
@@ -376,7 +379,7 @@ int client_send_bytes (client_t *client, const void *buf, unsigned len)
     ret = con_send (&client->connection, buf, len);
 
     if (client->connection.error)
-        DEBUG0 ("Client connection died");
+        DEBUG3 ("Client %"PRIu64 " connection on %s from %s died", client->connection.id, (client->mount ? client->mount:"unknown"), &client->connection.ip[0]);
 
     return ret;
 }
@@ -436,6 +439,11 @@ void client_set_queue (client_t *client, refbuf_t *refbuf)
         refbuf_addref (client->refbuf);
 
     client->pos = 0;
+}
+
+int is_worker_incoming (worker_t *w)
+{
+    return (w == worker_incoming) ? 1 : 0;
 }
 
 static uint64_t worker_check_time_ms (worker_t *worker)
@@ -723,6 +731,7 @@ void *worker (void *arg)
                         worker->current_time.tv_sec = (time_t)(worker->time_ms/1000);
                     }
                     c++;
+                    errno = 0;
                     ret = client->ops->process (client);
                     if (ret < 0)
                     {
@@ -777,7 +786,7 @@ void worker_balance_trigger (time_t now)
         worker_least_used = find_least_busy_handler (log_counts);
         if (worker_balance_to_check)
         {
-            worker_balance_to_check->move_allocations = 50;
+            worker_balance_to_check->move_allocations = 500;
             worker_balance_to_check = worker_balance_to_check->next;
         }
         if (worker_balance_to_check == NULL)
@@ -805,6 +814,7 @@ static void worker_start (void)
     {
         worker_incoming = handler;
         handler->thread = thread_create ("worker", worker, handler, THREAD_ATTACHED);
+        thread_rwlock_rlock (&global.workers_rw);
         thread_rwlock_unlock (&workers_lock);
         INFO0 ("starting incoming worker thread");
         worker_start();  // single level recursion, just get a special worker thread set up
@@ -816,6 +826,7 @@ static void worker_start (void)
     worker_least_used = worker_balance_to_check = workers;
     thread_rwlock_unlock (&workers_lock);
 
+    thread_rwlock_rlock (&global.workers_rw);
     handler->thread = thread_create ("worker", worker, handler, THREAD_ATTACHED);
 }
 
@@ -833,7 +844,7 @@ static void worker_stop (void)
             workers = handler->next;
             worker_least_used = worker_balance_to_check = workers;
             if (workers)
-                workers->move_allocations = 100;
+                workers->move_allocations = 1000;
             worker_count--;
         }
         else
@@ -842,11 +853,12 @@ static void worker_stop (void)
             worker_incoming = NULL;
             INFO0 ("stopping incoming worker thread");
         }
-        thread_rwlock_unlock (&workers_lock);
 
         if (handler)
         {
             handler->running = 0;
+            thread_rwlock_unlock (&workers_lock);
+
             worker_wakeup (handler);
 
             thread_join (handler->thread);
@@ -855,9 +867,11 @@ static void worker_stop (void)
             sock_close (handler->wakeup_fd[1]);
             sock_close (handler->wakeup_fd[0]);
             free (handler);
+            thread_rwlock_unlock (&global.workers_rw);
+            thread_rwlock_wlock (&workers_lock);
         }
-        thread_rwlock_wlock (&workers_lock);
     } while (workers == NULL && worker_incoming);
+    thread_rwlock_unlock (&workers_lock);
 }
 
 
@@ -870,12 +884,6 @@ void workers_adjust (int new_count)
             worker_start ();
         else if (worker_count > new_count)
             worker_stop ();
-    }
-    if (worker_count == 0)
-    {
-        logger_commits(0);
-        sock_close (logger_fd[1]);
-        sock_close (logger_fd[0]);
     }
 }
 
@@ -893,37 +901,38 @@ static void logger_commits (int id)
 
 static void *log_commit_thread (void *arg)
 {
-   INFO0 ("started");
-   while (1)
-   {
-       int ret = util_timed_wait_for_fd (logger_fd[0], 5000);
-       if (ret == 0) continue;
-       if (ret > 0)
-       {
-           char cm[80];
-           ret = pipe_read (logger_fd[0], cm, sizeof cm);
-           if (ret > 0)
-           {
-               // fprintf (stderr, "logger woken with %d\n", ret);
-               log_commit_entries ();
-               continue;
-           }
-       }
-       if (ret < 0 && sock_recoverable (sock_error()))
-           continue;
-       int err = sock_error();
-       sock_close (logger_fd[0]);
-       sock_close (logger_fd[1]);
-       if (worker_count)
-       {
-           worker_control_create (logger_fd);
-           ERROR1 ("logger received code %d", err);
-           continue;
-       }
-       // fprintf (stderr, "logger closed with zero workers\n");
-       break;
-   }
-   return NULL;
+    INFO0 ("started");
+    while (1)
+    {
+        int ret = util_timed_wait_for_fd (logger_fd[0], 5000);
+        if (ret == 0) continue;
+        if (ret > 0)
+        {
+            char cm[80];
+            ret = pipe_read (logger_fd[0], cm, sizeof cm);
+            if (ret > 0)
+            {
+                // fprintf (stderr, "logger woken with %d\n", ret);
+                log_commit_entries ();
+                continue;
+            }
+        }
+        int err = 0;
+        if (ret < 0 && sock_recoverable ((err = sock_error())))
+            continue;
+        sock_close (logger_fd[0]);
+        if (worker_count)
+        {
+            worker_control_create (logger_fd);
+            ERROR1 ("logger received code %d", err);
+            continue;
+        }
+        log_commit_entries ();
+        // fprintf (stderr, "logger closed with zero workers\n");
+        break;
+    }
+    thread_rwlock_unlock (&global.workers_rw);
+    return NULL;
 }
 
 
@@ -933,8 +942,16 @@ void worker_logger_init (void)
     log_set_commit_callback (logger_commits);
 }
 
-void worker_logger (void)
+void worker_logger (int stop)
 {
+    if (stop)
+    {
+       logger_commits(0);
+       sock_close (logger_fd[1]);
+       logger_fd[1] = -1;
+       return;
+    }
+    thread_rwlock_rlock (&global.workers_rw);
     thread_create ("Log Thread", log_commit_thread, NULL, THREAD_DETACHED);
 }
 
