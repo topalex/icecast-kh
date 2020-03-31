@@ -39,7 +39,7 @@ struct connection_tag
     uint64_t id;
 
     time_t con_time;
-    union {
+    struct {
         time_t      time;
         uint64_t    offset;
     } discon;
@@ -97,6 +97,8 @@ void connection_bufs_flush (struct connection_bufs *v);
 int  connection_bufs_append (struct connection_bufs *vectors, void *buf, unsigned int len);
 int  connection_bufs_read (connection_t *con, struct connection_bufs *vecs, int skip);
 int  connection_bufs_send (connection_t *con, struct connection_bufs *vecs, int skip);
+int  connection_unreadable (connection_t *con);
+
 
 #define CHUNK_HDR_SZ            16
 

@@ -608,10 +608,9 @@ static void file_release (client_t *client)
     fh_node *fh = client->shared_data;
     int ret = -1;
 
-    if (fh->finfo.limit && (client->flags & CLIENT_AUTHENTICATED))
+    if ((fh->finfo.flags & FS_FALLBACK) && (client->flags & CLIENT_AUTHENTICATED))
     {
         // reduce from global count
-        stats_event_dec (NULL, "listeners");
         global_lock();
         global.listeners--;
         global_unlock();
@@ -754,6 +753,8 @@ static int prefile_send (client_t *client)
                     return -1;
                 if (file_in_use (fh->f)) // is there a file to read from
                 {
+                    if (fh->format->detach_queue_block)
+                        fh->format->detach_queue_block (NULL, client->refbuf);
                     refbuf_release (client->refbuf);
                     client->refbuf = NULL;
                     client->pos = 0;
@@ -776,6 +777,8 @@ static int prefile_send (client_t *client)
                 refbuf_t *to_go = client->refbuf;
                 refbuf = client->refbuf = to_go->next;
                 to_go->next = NULL;
+                if (fh->format && fh->format->detach_queue_block)
+                    fh->format->detach_queue_block (NULL, client->refbuf);
                 refbuf_release (to_go);
             }
             client->pos = 0;
@@ -1011,6 +1014,13 @@ int fserve_setup_client_fb (client_t *client, fbinfo *finfo)
     fh_add_client (fh, client);
     thread_mutex_unlock (&fh->lock);
     client->shared_data = fh;
+
+    if ((fh->finfo.flags & FS_FALLBACK) && (client->flags & CLIENT_AUTHENTICATED))
+    {
+        global_lock();
+        global.listeners++;     // do we want to ocmpare with max listeners?
+        global_unlock();
+    }
 
     if (client->check_buffer == NULL)
         client->check_buffer = format_generic_write_to_client;

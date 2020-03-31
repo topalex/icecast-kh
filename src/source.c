@@ -273,6 +273,8 @@ void source_clear_source (source_t *source)
         refbuf_t *to_go = source->stream_data;
         source->stream_data = to_go->next;
         to_go->next = NULL;
+        if (source->format->detach_queue_block)
+            source->format->detach_queue_block (source, to_go);
         refbuf_release (to_go);
     }
     source->min_queue_point = NULL;
@@ -432,6 +434,17 @@ static int listener_check_intro (cache_file_contents *cache, client_t *client, i
 }
 
 
+uint32_t source_convert_qvalue (source_t *source, uint32_t value)
+{
+    if (value & 0x80000000)
+    {   // so in secs;
+        value &= ~0x80000000;
+        return source->incoming_rate * value;
+    }
+    return value;
+}
+
+
 /* Update stats from source processing, this should be called regulary (every
  * few seconds) to keep totals up to date.
  */
@@ -459,6 +472,37 @@ static void update_source_stats (source_t *source)
     stats_release (source->stats);
     stats_event_add (NULL, "stream_kbytes_sent", kbytes_sent);
     stats_event_add (NULL, "stream_kbytes_read", kbytes_read);
+    if (incoming_rate)
+    {
+        int log = 0;
+        uint32_t qlen = (float)source_convert_qvalue (source, source->queue_len_value);
+        if (qlen)
+        {
+            float ratio = source->queue_size_limit / (float)qlen;
+            if (ratio < 0.85 || ratio > 1.15)
+                log = 1;    // sizeable change in result so log it
+        }
+        source->queue_size_limit = qlen;
+        source->min_queue_size = source_convert_qvalue (source, source->min_queue_len_value);
+        source->default_burst_size = source_convert_qvalue (source, source->default_burst_value);
+
+        // sanity checks
+        if (source->default_burst_size > 50000000)
+            source->default_burst_size = 100000;
+        if (source->queue_size_limit > 1000000000)
+            source->queue_size_limit = 1000000;
+        if (source->min_queue_size > 50000000 || source->min_queue_size < source->default_burst_size)
+            source->min_queue_size = source->default_burst_size;
+        if (source->min_queue_size + 40000 > source->queue_size_limit)
+            source->queue_size_limit = source->min_queue_size + 40000;
+
+        if (log)
+        {
+            DEBUG2 ("%s queue size set to %u", source->mount, source->queue_size_limit);
+            DEBUG2 ("%s min queue size set to %u", source->mount, source->min_queue_size);
+            DEBUG2 ("%s burst size set to %u", source->mount, source->default_burst_size);
+        }
+    }
 
     source->bytes_sent_at_update = source->format->sent_bytes;
     source->bytes_read_since_update %= 1024;
@@ -481,7 +525,7 @@ int source_read (source_t *source)
     refbuf_t *refbuf = NULL;
     int skip = 1, loop = 1;
     time_t current = client->worker->current_time.tv_sec;
-    long queue_size_target = 0;
+    unsigned long queue_size_target = 0;
     int fds = 0;
 
     if (global.running != ICE_RUNNING)
@@ -619,13 +663,14 @@ int source_read (source_t *source)
                 /* save stream to file */
                 if (source->dumpfile && source->format->write_buf_to_file)
                     source->format->write_buf_to_file (source, refbuf);
-                if (source->shrink_time == 0 && (source->buffer_count & 7) == 7)
+                if (source->shrink_time == 0 && (source->buffer_count & 31) == 31)
                 {
                     // kick off timed response to find oldest buffer. Every so many buffers
                     source->shrink_pos = source->client->queue_pos - source->min_queue_offset;
-                    source->shrink_time = client->worker->time_ms + 500;
+                    source->shrink_time = client->worker->time_ms + 600;
                     break;
                 }
+                skip = 0;
             }
             else
             {
@@ -637,6 +682,8 @@ int source_read (source_t *source)
                 }
                 break;
             }
+            if ((source->buffer_count & 3) == 3)
+                source->incoming_rate = (long)rate_avg (source->in_bitrate);
             loop--;
         } while (loop);
 
@@ -644,19 +691,20 @@ int source_read (source_t *source)
         {
             if (source->shrink_time > client->worker->time_ms)
                 break;      // not time yet to consider the purging point
-            queue_size_target = 4000 + (source->client->queue_pos - source->shrink_pos);
+            queue_size_target = (source->client->queue_pos - source->shrink_pos);
             source->shrink_pos = 0;
             source->shrink_time = 0;
         }
-        /* lets see if we have too much data in the queue */
-        if (queue_size_target == 0)
+        /* lets see if we have too much/little data in the queue */
+        if ((queue_size_target < source->min_queue_size) || (queue_size_target > source->queue_size_limit))
             queue_size_target = (source->listeners) ? source->queue_size_limit : source->min_queue_size;
 
-        loop = 40 + (source->incoming_rate >> 15); // scale max on high bitrates
+        loop = 48 + (source->incoming_rate >> 13); // scale max on high bitrates
+        queue_size_target += 8000; // lets not be too tight to the limit
         while (source->queue_size > queue_size_target && loop)
         {
             refbuf_t *to_go = source->stream_data;
-            if (to_go->next == NULL) // always leave at least one on the queue
+            if (to_go == NULL || to_go->next == NULL) // always leave at least one on the queue
                 break;
             source->stream_data = to_go->next;
             source->queue_size -= to_go->len;
@@ -667,6 +715,8 @@ int source_read (source_t *source)
                 source->min_queue_point = to_go->next;
             }
             to_go->next = NULL;
+            if (source->format->detach_queue_block)
+                source->format->detach_queue_block (source, to_go);
             refbuf_release (to_go);
             loop--;
         }
@@ -712,8 +762,6 @@ static int source_client_read (client_t *client)
     }
     if (source_running (source))
     {
-        if ((source->buffer_count & 3) == 3)
-            source->incoming_rate = (long)rate_avg (source->in_bitrate);
         if (source->limit_rate)
         {
             if (source->limit_rate < (8 * source->incoming_rate) && global.running == ICE_RUNNING)
@@ -852,7 +900,7 @@ static int source_queue_advance (client_t *client)
                 // we may need to copy the complete frame for private use
                 if (client->pos < client->refbuf->len)
                 {
-                    refbuf_t *copy = refbuf_copy (client->refbuf);
+                    refbuf_t *copy = source->format->qblock_copy (client->refbuf);
                     client->refbuf = copy;
                     client->flags |= CLIENT_HAS_INTRO_CONTENT;
                     DEBUG2 ("client %s requeued copy on %s", client->connection.ip, source->mount);
@@ -916,26 +964,43 @@ static int locate_start_on_queue (source_t *source, client_t *client)
     }
     else
     {
-        const char *header = httpp_getvar (client->parser, "initial-burst");
-        const char *arg = httpp_get_query_param (client->parser, "burst");
         size_t size = source->min_queue_size;
-        off_t v = source->default_burst_size;
-        if (arg)
-            v = atol (arg);
-        else if (header)
-            v = atol (header);
-        v -= client->connection.sent_bytes; /* have we sent data already */
-        refbuf = source->min_queue_point;
-        lag = source->min_queue_offset;
-        // DEBUG3 ("size %lld, v %lld, lag %ld", size, v, lag);
-        while (size > v && refbuf && refbuf->next)
+        uint32_t v = -1;
+        const char *param = httpp_getvar (client->parser, "initial-burst");
+
+        if (param)
+            config_qsizing_conv_a2n (param, &v);
+        else
         {
-            size -= refbuf->len;
-            lag -= refbuf->len;
-            refbuf = refbuf->next;
+            param = httpp_get_query_param (client->parser, "burst");
+            if (param)
+                config_qsizing_conv_a2n (param, &v);
         }
-        if (lag < 0)
-            ERROR1 ("Odd, lag is negative %ld", lag);
+        if (param)
+        {
+            v = source_convert_qvalue (source, (uint32_t)v);
+            DEBUG4 ("listener from %s (on %s) requested burst (%s, %u)", &client->connection.ip[0], source->mount, param, v);
+        }
+        else
+            v = source->default_burst_size;
+
+        if (v > client->connection.sent_bytes)
+        {
+            v -= client->connection.sent_bytes; /* have we sent data already */
+            refbuf = source->min_queue_point;
+            lag = source->min_queue_offset;
+            // DEBUG3 ("size %lld, v %lld, lag %ld", size, v, lag);
+            while (size > v && refbuf && refbuf->next)
+            {
+                size -= refbuf->len;
+                lag -= refbuf->len;
+                refbuf = refbuf->next;
+            }
+            if (lag < 0)
+                ERROR1 ("Odd, lag is negative %ld", lag);
+        }
+        else
+            lag = refbuf->len;
     }
 
     while (refbuf)
@@ -961,7 +1026,7 @@ static int locate_start_on_queue (source_t *source, client_t *client)
 
 static void source_preroll_logging (source_t *source, client_t *client)
 {
-    if (client->intro_offset < 0 || (client->flags & CLIENT_HAS_INTRO_CONTENT))
+    if (source->intro_filename == NULL || client->intro_offset < 0 || (client->flags & CLIENT_HAS_INTRO_CONTENT))
         return; // content provided separately, auth or queue block copy
     if (source->preroll_log_id < 0)
     {
@@ -990,6 +1055,8 @@ static int http_source_introfile (client_t *client)
             if (source->intro_skip_replay)
                 listener_skips_intro (source->intro_ipcache, client, source->intro_skip_replay);
             /* better find the right place in queue for this client */
+            if (source->format->detach_queue_block)
+                source->format->detach_queue_block (source, client->refbuf); // in case of private queue
             client_set_queue (client, NULL);
             client->check_buffer = source_queue_advance;
             client->intro_offset = -1;
@@ -1059,6 +1126,12 @@ static int http_source_intro (client_t *client)
         return source_queue_advance (client);
     }
     source_t *source = client->shared_data;
+    refbuf_t *n = client->refbuf ? client->refbuf->next : NULL;
+    if (n)
+        client->refbuf->next = NULL;
+    refbuf_release (client->refbuf);
+    client->refbuf = n;
+    client->pos = 0;
     client->intro_offset = source->intro_start;
     client->check_buffer = http_source_introfile;
     return http_source_introfile (client);
@@ -1121,41 +1194,36 @@ static int http_source_listener (client_t *client)
 }
 
 
+// detach client from the source, enter with lock (probably read) and exit with write lock.
 void source_listener_detach (source_t *source, client_t *client)
 {
     client->wakeup = NULL;
     if (client->check_buffer != http_source_listener) // not in http headers
     {
         refbuf_t *ref = client->refbuf;
-        int lag = source->client->queue_pos - client->queue_pos;
 
-        if (lag && lag >= source->queue_size) // off the queue
+        if (ref)
         {
-            client->connection.error = 1;
-            client->pos = 0;
-            if ((client->flags & CLIENT_HAS_INTRO_CONTENT) == 0)
-                client->refbuf = NULL; // must of dropped off the end
-        }
-        else if (ref && (ref->flags & REFBUF_SHARED))
-        {
-            client->check_buffer = source->format->write_buf_to_client;
-
-            if (client->connection.error == 0 && client->pos < ref->len && source->fallback.mount)
+            if (ref->flags & REFBUF_SHARED)  // on the queue
             {
-                /* make a private copy so that a write can complete */
-                refbuf_t *copy = refbuf_copy (client->refbuf);
+                if (client->connection.error == 0 && client->pos < ref->len && source->fallback.mount)
+                {
+                    /* make a private copy so that a write can complete later */
+                    refbuf_t *copy = source->format->qblock_copy (client->refbuf);
 
-                client->refbuf = copy;
-                client->flags |= CLIENT_HAS_INTRO_CONTENT;
+                    client->refbuf = copy;
+                    client->flags |= CLIENT_HAS_INTRO_CONTENT;
+                }
+                else
+                    client->refbuf = NULL;
             }
-            else
-                client->refbuf = NULL;
         }
-        else
-            client->check_buffer = source->format->write_buf_to_client;
+        client->check_buffer = source->format->write_buf_to_client;
     }
     else
         client->check_buffer = NULL;
+    thread_rwlock_unlock (&source->lock);   // read lock in use!
+    thread_rwlock_wlock (&source->lock);
     avl_delete (source->clients, client, NULL);
 }
 
@@ -1232,52 +1300,65 @@ static int send_to_listener (client_t *client)
 
 int listener_waiting_on_source (source_t *source, client_t *client)
 {
-    thread_rwlock_unlock (&source->lock);
-    thread_rwlock_wlock (&source->lock);
-    //DEBUG2 ("termination count on %s now %lu", source->mount, source->termination_count);
-    if (client->connection.error)
+    int read_lock = 1, ret = 0;
+    while (1)
     {
-        source->termination_count--;
-        return -1;
-    }
-    if (source->fallback.mount)
-    {
-        int ret;
-
-        source_listener_detach (source, client);
-        thread_rwlock_unlock (&source->lock);
-        client->shared_data = NULL;
-        ret = move_listener (client, &source->fallback);
-        thread_rwlock_wlock (&source->lock);
-        source->termination_count--;
-        if (ret <= 0)
+        if (client->connection.error)
         {
+            source_listener_detach (source, client);    // return with write lock
+            read_lock = 0;  // skip the possible reacquiring of the lock later.
             source->listeners--;
-            return ret;
+            client->shared_data = NULL;
+            ret = -1;
+            break;
         }
-        source_setup_listener (source, client);
-    }
-    else
-        source->termination_count--;
-    if (source->flags & SOURCE_TERMINATING)
-    {
-        if ((source->flags & SOURCE_PAUSE_LISTENERS) && global.running == ICE_RUNNING)
+        if (source->fallback.mount)
         {
-            if (client->refbuf && (client->refbuf->flags & SOURCE_QUEUE_BLOCK))
-                client->refbuf = NULL;
-            client->ops = &listener_pause_ops;
-            client->flags |= CLIENT_HAS_MOVED;
-            client->schedule_ms = client->worker->time_ms + 60;
-            client->timer_start = client->worker->current_time.tv_sec;
-            return 0;
+            source_listener_detach (source, client);
+            source->listeners--;
+            thread_rwlock_unlock (&source->lock);
+            client->shared_data = NULL;
+            ret = move_listener (client, &source->fallback);
+            thread_rwlock_wlock (&source->lock);
+            if (ret <= 0)
+            {
+                source->termination_count--;
+                global_lock();
+                global.listeners--;
+                global_unlock();
+
+                return ret;
+            }
+            source->listeners++;
+            source_setup_listener (source, client);
+            ret = 0;
         }
-        return -1;
+        if (source->flags & SOURCE_TERMINATING)
+        {
+            if ((source->flags & SOURCE_PAUSE_LISTENERS) && global.running == ICE_RUNNING)
+            {
+                if (client->refbuf && (client->refbuf->flags & SOURCE_QUEUE_BLOCK))
+                    client->refbuf = NULL;
+                client->ops = &listener_pause_ops;
+                client->flags |= CLIENT_HAS_MOVED;
+                client->schedule_ms = client->worker->time_ms + 60;
+                client->timer_start = client->worker->current_time.tv_sec;
+                break;
+            }
+            ret = -1;
+            break;
+        }
+        client->ops = &listener_wait_ops;
+        client->schedule_ms = client->worker->time_ms + 100;
+        break;
     }
-    /* wait for all source listeners to go through this */
-    // DEBUG1 ("listener now waiting for the other %d listeners", source->termination_count);
-    client->ops = &listener_wait_ops;
-    client->schedule_ms = client->worker->time_ms + 100;
-    return 0;
+    if (read_lock) // acquire write lock if still with read lock
+    {
+        thread_rwlock_unlock (&source->lock);
+        thread_rwlock_wlock (&source->lock);
+    }
+    source->termination_count--;
+    return ret;
 }
 
 
@@ -1294,9 +1375,6 @@ static int send_listener (source_t *source, client_t *client)
 
     if (source->flags & SOURCE_LISTENERS_SYNC)
         return listener_waiting_on_source (source, client);
-
-    if (client->connection.error)
-        return -1;
 
     /* check for limited listener time */
     if (client->flags & CLIENT_RANGE_END)
@@ -1326,33 +1404,27 @@ static int send_listener (source_t *source, client_t *client)
     /* progessive slowdown if nearing max bandwidth.  */
     if (global.max_rate)
     {
-        if (throttle_sends > 2) /* exceeded limit, skip 30ms */
+        if (throttle_sends > 2) /* exceeded limit, skip */
         {
-            client->schedule_ms += (source->incoming_adj * 4);
+            client->schedule_ms += 40 + (client->throttle * 3);
             return 0;
         }
         if (throttle_sends > 1) /* slow down any multiple sends */
         {
-            loop = 4;
-            client->schedule_ms += (source->incoming_adj * 6);
+            loop = 3;
+            client->schedule_ms += (client->throttle * 4);
         }
         if (throttle_sends > 0)
         {
             /* make lagging listeners, lag further on high server bandwidth use */
             if (lag > (source->incoming_rate*2))
-                client->schedule_ms += 100 + (source->incoming_adj * 6);
+                client->schedule_ms += 100 + (client->throttle * 3);
         }
     }
     // set between 1 and 40
-    client->throttle = source->incoming_adj > 40 ? 40 : (source->incoming_adj > 0 ? source->incoming_adj : 1);
+    client->throttle = source->incoming_adj > 25 ? 25 : (source->incoming_adj > 0 ? source->incoming_adj : 1);
     while (1)
     {
-        /* jump out if client connection has died */
-        if (client->connection.error)
-        {
-            ret = -1;
-            break;
-        }
         /* lets not send too much to one client in one go, but don't
            sleep for too long if more data can be sent */
         if (loop == 0 || total_written > limiter)
@@ -1363,6 +1435,12 @@ static int send_listener (source_t *source, client_t *client)
         bytes = client->check_buffer (client);
         if (bytes < 0)
         {
+            if (client->connection.error || (total_written == 0 && connection_unreadable (&client->connection)))
+            {
+                ret = -1;
+                break;
+            }
+            client->schedule_ms += 15;
             break;  /* can't write any more */
         }
 
@@ -1375,11 +1453,14 @@ static int send_listener (source_t *source, client_t *client)
         global_add_bitrates (global.out_bitrate, total_written, worker->time_ms);
     }
 
-    if (source->shrink_pos)
+    if (source->shrink_time && client->connection.error == 0)
     {
+        lag = source->client->queue_pos - client->queue_pos;
+        if (lag > source->queue_size_limit)
+            lag = source->queue_size_limit; // impose a higher lag value
         thread_spin_lock (&source->shrink_lock);
         if (client->queue_pos < source->shrink_pos)
-            source->shrink_pos = client->queue_pos;
+            source->shrink_pos = source->client->queue_pos - lag;
         thread_spin_unlock (&source->shrink_lock);
     }
     return ret;
@@ -1433,10 +1514,13 @@ void source_init (source_t *source)
     source->prev_listeners = -1;
     source->bytes_sent_at_update = 0;
     source->stats_interval = 5;
-    /* so the first set of average stats after 3 seconds */
-    source->client_stats_update = source->last_read + 3;
+    /* so the first set of average stats after 4 seconds */
+    source->client_stats_update = source->last_read + 4;
     source->skip_duration = 40;
     source->buffer_count = 0;
+    source->queue_size_limit = 200000000; // initial sizing
+    source->default_burst_size = 300000;
+    source->min_queue_size = 600000;
 
     util_dict_free (source->audio_info);
     source->audio_info = util_dict_new();
@@ -1597,6 +1681,9 @@ void source_set_fallback (source_t *source, const char *dest_mount)
 
 int source_set_intro (source_t *source, const char *file_pattern)
 {
+    if (file_pattern == NULL || source == NULL)
+        return -1;
+
     ice_config_t *config = config_get_config_unlocked ();
     char buffer[4096];
     unsigned int len = sizeof buffer;
@@ -1877,7 +1964,19 @@ static void source_apply_mount (source_t *source, mount_proxy *mountinfo)
 
     /* handle MIME-type */
     if (mountinfo && mountinfo->type)
+    {
+        if (source->format)
+        {
+            format_type_t type = format_get_type (mountinfo->type);
+            if (type == FORMAT_TYPE_UNDEFINED)
+                WARN2 ("type specified for %s is unrecognised (%s)", source->mount, mountinfo->type);
+            else
+                source->format->type = format_get_type (mountinfo->type);
+            free (source->format->contenttype);
+            source->format->contenttype = strdup (mountinfo->type);
+        }
         stats_set (source->stats, "server_type", mountinfo->type);
+    }
     else
         if (source->format && source->format->contenttype)
             stats_set (source->stats, "server_type", source->format->contenttype);
@@ -1968,22 +2067,18 @@ static void source_apply_mount (source_t *source, mount_proxy *mountinfo)
             source->intro_skip_replay = mountinfo->intro_skip_replay;
         }
     }
-    if (mountinfo && mountinfo->queue_size_limit)
-        source->queue_size_limit = mountinfo->queue_size_limit;
 
     if (mountinfo && mountinfo->source_timeout)
         source->timeout = mountinfo->source_timeout;
 
-    if (mountinfo && mountinfo->burst_size >= 0)
-        source->default_burst_size = (unsigned int)mountinfo->burst_size;
+    if (mountinfo && mountinfo->queue_size_limit)
+        source->queue_len_value = mountinfo->queue_size_limit;
 
-    if (mountinfo && mountinfo->min_queue_size >= 0)
-        source->min_queue_size = mountinfo->min_queue_size;
-    if (source->min_queue_size < source->default_burst_size)
-        source->min_queue_size = source->default_burst_size;
+    if (mountinfo && mountinfo->burst_size)
+        source->default_burst_value = (unsigned int)mountinfo->burst_size;
 
-    if (source->min_queue_size + 40000 > source->queue_size_limit)
-        source->queue_size_limit = source->min_queue_size + 40000;
+    if (mountinfo && mountinfo->min_queue_size)
+        source->min_queue_len_value = mountinfo->min_queue_size;
 
     source->wait_time = 0;
     if (mountinfo && mountinfo->wait_time)
@@ -2000,10 +2095,13 @@ void source_update_settings (ice_config_t *config, source_t *source, mount_proxy
     int len;
 
     /* set global settings first */
-    source->queue_size_limit = config->queue_size_limit;
-    source->min_queue_size = config->min_queue_size;
-    source->timeout = config->source_timeout;
-    source->default_burst_size = config->burst_size;
+    if (mountinfo == NULL)
+    {
+        source->queue_len_value = config->queue_size_limit;
+        source->min_queue_len_value = config->min_queue_size;
+        source->timeout = config->source_timeout;
+        source->default_burst_value = config->burst_size;
+    }
     stats_lock (source->stats, source->mount);
 
     len = strlen (config->hostname) + strlen(source->mount) + 16;
@@ -2052,9 +2150,6 @@ void source_update_settings (ice_config_t *config, source_t *source, mount_proxy
     }
     stats_release (source->stats);
     DEBUG1 ("public set to %d", source->yp_public);
-    DEBUG1 ("queue size to %u", source->queue_size_limit);
-    DEBUG1 ("min queue size to %u", source->min_queue_size);
-    DEBUG1 ("burst size to %u", source->default_burst_size);
     DEBUG1 ("source timeout to %u", source->timeout);
 }
 
@@ -2087,26 +2182,44 @@ static int source_client_callback (client_t *client)
 static void source_run_script (char *command, char *mountpoint)
 {
     pid_t pid, external_pid;
+    char *p, *comm;
+    int wstatus;
+
+    comm = p = strdup (command);
+#ifdef HAVE_STRSEP
+    strsep (&p, " \t");
+#else
+    if (strchr (command, ' '))  // possible misconfiguration, but unlikely to occur.
+        INFO1 ("arguments to command on %s not supported", mountpoint);
+#endif
+    if (access (comm, X_OK) != 0)
+    {
+        ERROR3 ("Unable to run command %s on %s (%s)", comm, mountpoint, strerror (errno));
+        free (comm);
+        return;
+    }
+    DEBUG2 ("Starting command %s on %s", comm, mountpoint);
 
     /* do a fork twice so that the command has init as parent */
     external_pid = fork();
     switch (external_pid)
     {
-        case 0:
+        case 0:     // child, don't log from here.
             switch (pid = fork ())
             {
                 case -1:
-                    ERROR2 ("Unable to fork %s (%s)", command, strerror (errno));
                     break;
                 case 0:  /* child */
-                    DEBUG1 ("Starting command %s", command);
 #ifdef HAVE_STRSEP
 #define MAX_SCRIPT_ARGS          20
                     {
-                        int i = 0;
+                        int i = 1;
                         char *p, *args [MAX_SCRIPT_ARGS+1];
 
-                        p = strdup (command);
+                        // default set unless overridden
+                        args[0] = comm;
+                        args[1] = mountpoint;
+                        args[2] = NULL;
                         while (i < MAX_SCRIPT_ARGS && (args[i] = strsep (&p, " \t")))
                         {
                             unsigned len = 4096;
@@ -2115,29 +2228,12 @@ static void source_run_script (char *command, char *mountpoint)
                                 args[i] = str;
                             i++;
                         }
-                        if (i == 1) // default is to supply mountpoint
-                        {
-                            args[1] = mountpoint;
-                            args[2] = NULL;
-                        }
-                        if (access (args[0], X_OK) != 0)
-                        {
-                            ERROR2 ("Unable to run command %s (%s)", args[0], strerror (errno));
-                            exit (0);
-                        }
                         close (0);
                         close (1);
                         close (2);
                         execvp ((const char *)args[0], args);
                     }
 #else
-                    if (access (command, X_OK) != 0)
-                    {
-                        ERROR2("Unable to run command %s (%s)", command, strerror (errno));
-                        exit (1);
-                    }
-                    if (strchr (command, ' '))
-                        WARN1 ("arguments to command on %s not supported", mountpoint);
                     close (0);
                     close (1);
                     close (2);
@@ -2148,13 +2244,18 @@ static void source_run_script (char *command, char *mountpoint)
                     break;
             }
             exit (0);
-        case -1:
+        case -1:    // ok, in parent context, no lock clash.
             ERROR1 ("Unable to fork %s", strerror (errno));
             break;
         default: /* parent */
-            waitpid (external_pid, NULL, 0);
+            do
+            {
+                if (waitpid (external_pid, &wstatus, 0) < 0)
+                    break;
+            } while (WIFEXITED(wstatus) == 0 && WIFSIGNALED(wstatus) == 0);
             break;
     }
+    free (comm);
 }
 #endif
 
@@ -2316,9 +2417,17 @@ static int source_listener_release (source_t *source, client_t *client)
 
     if (client->shared_data == source) // still attached to source?
     {
-        thread_rwlock_unlock (&source->lock);
-        thread_rwlock_wlock (&source->lock);
-
+        while (1)
+        {
+            refbuf_t *r = client->refbuf;
+            if (r == NULL || (r->flags & REFBUF_SHARED))
+                break;
+            client->refbuf = r->next;
+            r->next = NULL;
+            if (source->format->detach_queue_block)
+                source->format->detach_queue_block (source, r);
+            refbuf_release (r);
+        }
         /* search through sources client list to find previous link in list */
         source_listener_detach (source, client);
         source->listeners--;
@@ -2328,7 +2437,6 @@ static int source_listener_release (source_t *source, client_t *client)
             rate_reduce (source->out_bitrate, 1000);
     }
 
-    stats_event_dec (NULL, "listeners");
     /* change of listener numbers, so reduce scope of global sampling */
     global_reduce_bitrate_sampling (global.out_bitrate);
     DEBUG2 ("Listener %" PRIu64 " leaving %s", client->connection.id, source->mount);
@@ -2401,7 +2509,6 @@ int source_add_listener (const char *mount, mount_proxy *mountinfo, client_t *cl
                     if (move_listener (client, &f) == 0)
                     {
                         /* source dead but fallback to file found */
-                        stats_event_inc (NULL, "listeners");
                         stats_event_inc (NULL, "listener_connections");
                         return 0;
                     }
@@ -2585,7 +2692,6 @@ int source_add_listener (const char *mount, mount_proxy *mountinfo, client_t *cl
     thread_rwlock_unlock (&source->lock);
     global_reduce_bitrate_sampling (global.out_bitrate);
 
-    stats_event_inc (NULL, "listeners");
     stats_event_inc (NULL, "listener_connections");
 
     if (do_process) // send something back quickly
@@ -2832,14 +2938,16 @@ static int source_change_worker (source_t *source, client_t *client)
             int base = (client->connection.id & 7) << 5;
             if ((diff > 2000 && worker->count > 200) || (diff > (source->listeners>>4) + base))
             {
+                char *mount = strdup (source->mount);
                 this_worker->move_allocations--;
                 thread_rwlock_unlock (&source->lock);
                 ret = client_change_worker (client, worker);
                 thread_rwlock_unlock (&workers_lock);
                 if (ret)
-                    DEBUG3 ("moving source %s from %p to %p", source->mount, this_worker, worker);
+                    DEBUG3 ("moving source %s from %p to %p", mount, this_worker, worker);
                 else
                     thread_rwlock_wlock (&source->lock);
+                free (mount);
                 return ret;
             }
         }
@@ -2886,9 +2994,10 @@ int listener_change_worker (client_t *client, source_t *source)
         this_worker->move_allocations--;
 
         thread_rwlock_unlock (&source->lock);
+        uint64_t  id = client->connection.id;
         ret = client_change_worker (client, dest_worker);
         if (ret)
-            DEBUG4 ("moving listener %" PRIu64 " on %s from %p to %p", client->connection.id, source->mount, this_worker, dest_worker);
+            DEBUG4 ("moving listener %" PRIu64 " on %s from %p to %p", id, source->mount, this_worker, dest_worker);
         else
             thread_rwlock_rlock (&source->lock);
     }

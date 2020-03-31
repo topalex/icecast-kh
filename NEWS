@@ -16,6 +16,34 @@ Feature differences from SVN trunk
 
 any extra tags are shown in the conf/icecast.xml.dist file
 
+2.4.0-kh13
+. Fix an annoying race case. memory corruption in certain cases that are hard to trigger
+  normally but typically involes a listener disconnecting in certain conditions.
+. tightened up use-after-free cases with regard to the queue pruning.
+. leak fixes with intro via auth.
+. Allow seconds to be specified in burst and queue size fields. Just specify the number followed by s
+  eg 30s  or 5s. Eventually we could make this the default so that is can apply to various
+  bitrates.
+. small minor cleanups across the board.
+
+2.4.0-kh12
+. fix up some incorrect or stale block cases from previous release for non-ogg streams. Usually
+  cause by short write triggers or queue jumps.
+. change default charset for non-ogg streams to utf8 instead of latin1, you ca still use
+  latin1 either with <charset> mount setting or charset= query param to metadata
+. global listeners count could get messed up with fallback to files, also make it a regular
+  update stat in-line with other global stats.
+. avoid possible crash case on log re-opening, not so common.
+
+
+2.4.0-kh11
+. fix issue with timelimited listeners and html5 players with range requests
+. security fix for auth url when allowing certain headers to be passed.
+. fix for mpeg block expansion handling, led to cases of parsing failures
+. block scaling changes for mpeg based streams.
+. internal restructure for metadata on non-ogg streams. For code maintainability.
+. bounce admin mount request clients to worker with the source, reduces lock contention with lots of sources
+
 2.4.0-kh10
 . stop ID3 in streams for now, some browsers can have playback problems.
 . fix memory leak case in the queue from previous release.
