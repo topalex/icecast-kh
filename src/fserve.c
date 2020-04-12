@@ -624,31 +624,37 @@ static void file_release (client_t *client)
     if (client->flags & CLIENT_AUTHENTICATED && client->parser->req_type == httpp_req_get)
     {
         const char *m = NULL;
+        char *uri = util_normalise_uri (httpp_getvar (client->parser, HTTPP_VAR_URI));
 
-        if (fh->finfo.flags & FS_FALLBACK)
-            m = httpp_getvar (client->parser, HTTPP_VAR_URI);
-        else if (client->mount)
-            m = client->mount;
-        else
-            m = fh->finfo.mount;
-        if (m)
-        {
-            ice_config_t *config;
-            char *mount = strdup (m);
-            mount_proxy *mountinfo;
-
+        if (strcmp (uri, "/admin.cgi") == 0 || strncmp("/admin/", uri, 7) == 0)
             remove_from_fh (fh, client);
-            client->shared_data = NULL;
-            config = config_get_config ();
-            mountinfo = config_find_mount (config, mount);
-            if (mountinfo && mountinfo->access_log.name)
-                logging_access_id (&mountinfo->access_log, client);
-            ret = auth_release_listener (client, mount, mountinfo);
-            config_release_config();
-            free (mount);
+        else {
+            if (fh->finfo.flags & FS_FALLBACK)
+                m = uri;
+            else if (client->mount)
+                m = client->mount;
+            else
+                m = fh->finfo.mount;
+            if (m)
+            {
+                ice_config_t *config;
+                char *mount = strdup (m);
+                mount_proxy *mountinfo;
+
+                remove_from_fh (fh, client);
+                client->shared_data = NULL;
+                config = config_get_config ();
+                mountinfo = config_find_mount (config, mount);
+                if (mountinfo && mountinfo->access_log.name)
+                    logging_access_id (&mountinfo->access_log, client);
+                ret = auth_release_listener (client, mount, mountinfo);
+                config_release_config();
+                free (mount);
+            }
+            else
+                remove_from_fh (fh, client);
         }
-        else
-            remove_from_fh (fh, client);
+        free(uri);
     }
     else
         remove_from_fh (fh, client);
