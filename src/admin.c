@@ -327,16 +327,19 @@ int admin_mount_request (client_t *client)
             // DEBUG0 (" moving admin request to alternate worker");
             return client_change_worker (client, src_worker);
         }
-        free (uri);
         thread_rwlock_wlock (&source->lock);
         if (source_available (source) == 0)
         {
             thread_rwlock_unlock (&source->lock);
             avl_tree_unlock (global.source_tree);
+            if (strncmp (cmd->request, "stats", 5) == 0)
+                return command_stats (client, uri);
             INFO1("Received admin command on unavailable mount \"%s\"", mount);
+            free (uri);
             return client_send_400 (client, "Source is not available");
         }
         avl_tree_unlock(global.source_tree);
+        free (uri);
         ret = cmd->handle.source (client, source, cmd->response);
         return ret;
     }
