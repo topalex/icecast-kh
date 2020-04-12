@@ -477,12 +477,15 @@ int fserve_client_create (client_t *httpclient, const char *path)
         /* the m3u can be generated, but send an m3u file if available */
         if (m3u_requested == 0 && xspf_requested == 0)
         {
-            if (redirect_client (path, httpclient) == 0)
+            config = config_get_config();
+            if (config->fileserve_redirect == 0 || httpclient->flags & CLIENT_IS_SLAVE ||
+                redirect_client (path, httpclient) == 0)
             {
                 if ((httpclient->flags & CLIENT_SKIP_ACCESSLOG) == 0)
                     WARN2 ("req for file \"%s\" %s", fullpath, strerror (errno));
                 ret = client_send_404 (httpclient, "The file you requested could not be found");
             }
+            config_release_config();
             free (fullpath);
             return ret;
         }
