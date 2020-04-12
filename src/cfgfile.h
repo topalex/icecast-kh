@@ -266,6 +266,7 @@ typedef struct ice_config_tag
     int64_t max_bandwidth;
     int max_listeners;
     int fileserve;
+    int fileserve_redirect;
     int on_demand; /* global setting for all relays */
 
     char *shoutcast_mount;

@@ -49,6 +49,7 @@
 #define CONFIG_DEFAULT_SHOUTCAST_MOUNT "/stream"
 #define CONFIG_DEFAULT_ICE_LOGIN 0
 #define CONFIG_DEFAULT_FILESERVE 1
+#define CONFIG_DEFAULT_FILESERVE_REDIRECT 1
 #define CONFIG_DEFAULT_TOUCH_FREQ 5
 #define CONFIG_DEFAULT_HOSTNAME "localhost"
 #define CONFIG_DEFAULT_PLAYLIST_LOG NULL
@@ -633,6 +634,7 @@ static void _set_defaults(ice_config_t *configuration)
     configuration->shoutcast_mount = (char *)xmlCharStrdup (CONFIG_DEFAULT_SHOUTCAST_MOUNT);
     configuration->ice_login = CONFIG_DEFAULT_ICE_LOGIN;
     configuration->fileserve = CONFIG_DEFAULT_FILESERVE;
+    configuration->fileserve_redirect = CONFIG_DEFAULT_FILESERVE_REDIRECT;
     configuration->touch_interval = CONFIG_DEFAULT_TOUCH_FREQ;
     configuration->on_demand = 0;
     configuration->dir_list = NULL;
@@ -1438,6 +1440,7 @@ static int _parse_root (xmlNodePtr node, ice_config_t *config)
         { "port",               config_get_port,    &config->port },
         { "bind-address",       config_get_str,     &bindaddress },
         { "fileserve",          config_get_bool,    &config->fileserve },
+        { "fileserve-redirect", config_get_bool,    &config->fileserve_redirect },
         { "relays-on-demand",   config_get_bool,    &config->on_demand },
         { "master-server",      config_get_str,     &config->master_server },
         { "master-username",    config_get_str,     &config->master_username },
