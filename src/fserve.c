@@ -624,7 +624,7 @@ static void file_release (client_t *client)
     if (client->flags & CLIENT_AUTHENTICATED && client->parser->req_type == httpp_req_get)
     {
         const char *m = NULL;
-        char *uri = util_normalise_uri (httpp_getvar (client->parser, HTTPP_VAR_URI));
+        const char *uri = util_normalise_uri (httpp_getvar (client->parser, HTTPP_VAR_URI));
 
         if (strcmp (uri, "/admin.cgi") == 0 || strncmp("/admin/", uri, 7) == 0)
             remove_from_fh (fh, client);
@@ -654,7 +654,6 @@ static void file_release (client_t *client)
             else
                 remove_from_fh (fh, client);
         }
-        free(uri);
     }
     else
         remove_from_fh (fh, client);
