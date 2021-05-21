@@ -1,5 +1,5 @@
 dnl Process this file with autoconf to produce a configure script.
-AC_INIT([Icecast], [2.4.0-kh14], [karl@kheyes.plus.com])
+AC_INIT([Icecast], [2.4.0-kh15], [karl@kheyes.plus.com])
 AC_CONFIG_AUX_DIR([build-aux])
 AM_INIT_AUTOMAKE([foreign])
 
@@ -60,7 +60,7 @@ AC_CHECK_TYPES([struct timespec])
 
 dnl Checks for library functions.
 AC_CHECK_FUNCS([localtime_r gmtime_r FindFirstFile])
-AC_CHECK_FUNCS([fseeko fnmatch chroot fork poll atoll strtoll strsep strcasecmp])
+AC_CHECK_FUNCS([fseeko fnmatch chroot fork poll atoll strtoll strsep strcasecmp strncasecmp])
 AC_CHECK_FUNCS([getrlimit gettimeofday ftime fsync glob pread pipe2 setresuid setresgid])
 AC_CHECK_TYPES([struct signalfd_siginfo],
                [AC_DEFINE(HAVE_SIGNALFD, 1 ,[Define if signalfd exists])], [],
