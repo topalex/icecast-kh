@@ -1,6 +1,7 @@
 /* threads.c: Thread Abstraction Functions
  *
  * Copyright (c) 1999, 2000 the icecast team <team@icecast.org>
+ * Copyright (c) 2020-2023 Karl Heyes <karl@kheyes.plus.com>
  *
  *  This library is free software; you can redistribute it and/or
  *  modify it under the terms of the GNU Library General Public
@@ -172,20 +173,20 @@ void thread_initialize(void)
     _mutextree = avl_tree_new(_compare_mutexes, NULL);
 
     /* we have to create this one by hand, because there's no
-    ** mutextree_mutex to lock yet! 
+    ** mutextree_mutex to lock yet!
     */
     _mutex_create(&_mutextree_mutex);
 
     _mutextree_mutex.mutex_id = _next_mutex_id++;
-    avl_insert(_mutextree, (void *)&_mutextree_mutex);
+    //avl_insert(_mutextree, (void *)&_mutextree_mutex);
 
     log_initialize();
     _logid = log_open("thread.log");
-    log_set_level(_logid, 4);
+    log_set_level(_logid, 256+4);
 #endif
 
     thread_mutex_create(&_threadtree_mutex);
-    thread_mutex_create(&_library_mutex);    
+    thread_mutex_create(&_library_mutex);
 
     /* initialize the thread tree and insert the main thread */
 
@@ -226,7 +227,7 @@ void thread_shutdown(void)
         thread_mutex_destroy(&_threadtree_mutex);
 #ifdef THREAD_DEBUG
         thread_mutex_destroy(&_mutextree_mutex);
-        
+
         avl_tree_free(_mutextree, _free_mutex);
 #endif
         avl_tree_free(_threadtree, _free_thread);
@@ -296,14 +297,14 @@ static void _catch_signals(void)
 }
 
 
-thread_type *thread_create_c(char *name, void *(*start_routine)(void *), 
+thread_type *thread_create_c(char *name, void *(*start_routine)(void *),
         void *arg, int detached, int line, const char *file)
 {
     thread_type *thread = NULL;
     thread_start_t *start = NULL;
     pthread_attr_t attr;
 
-    thread = (thread_type *)calloc(1, sizeof(thread_type));    
+    thread = (thread_type *)calloc(1, sizeof(thread_type));
     do {
         if (thread == NULL)
             break;
@@ -316,7 +317,7 @@ thread_type *thread_create_c(char *name, void *(*start_routine)(void *),
         thread->line = line;
         thread->file = file;
 
-        _mutex_lock (&_threadtree_mutex);    
+        _mutex_lock (&_threadtree_mutex);
         thread->thread_id = _next_thread_id++;
         _mutex_unlock (&_threadtree_mutex);
 
@@ -361,7 +362,7 @@ thread_type *thread_create_c(char *name, void *(*start_routine)(void *),
 }
 
 /* _mutex_create
-** 
+**
 ** creates a mutex
 */
 static void _mutex_create(mutex_t *mutex)
@@ -386,6 +387,9 @@ static void _mutex_create(mutex_t *mutex)
 
 void thread_mutex_create_c(mutex_t *mutex, int line, const char *file)
 {
+#ifdef THREAD_DEBUG
+    if (mutex == NULL) return;
+#endif
     _mutex_create(mutex);
 
 #ifdef THREAD_DEBUG
@@ -393,15 +397,20 @@ void thread_mutex_create_c(mutex_t *mutex, int line, const char *file)
     sprintf (mutex->name, "%s:%d", file, line);
     _mutex_lock(&_mutextree_mutex);
     mutex->mutex_id = _next_mutex_id++;
-    avl_insert(_mutextree, (void *)mutex);
+    if (_initialized)
+        avl_insert(_mutextree, (void *)mutex);
     _mutex_unlock(&_mutextree_mutex);
 
-    LOG_DEBUG3 ("mutex %s created (%s:%d)", mutex->name, file, line);
+    if (strcmp (file, __FILE__))
+        LOG_DEBUG3 ("mutex %s created (%s:%d)", mutex->name, file, line);
 #endif
 }
 
 void thread_mutex_destroy_c (mutex_t *mutex, int line, const char *file)
 {
+#ifdef THREAD_DEBUG
+    if (mutex == NULL) return;
+#endif
     int rc = pthread_mutex_destroy(&mutex->sys_mutex);
     if (rc)
     {
@@ -410,32 +419,44 @@ void thread_mutex_destroy_c (mutex_t *mutex, int line, const char *file)
     }
 
 #ifdef THREAD_DEBUG
+    if (mutex != &_mutextree_mutex)
+    {
     _mutex_lock(&_mutextree_mutex);
     avl_delete(_mutextree, mutex, _free_mutex);
     _mutex_unlock(&_mutextree_mutex);
+    }
 #endif
 }
 
 void thread_mutex_lock_c(mutex_t *mutex, int line, const char *file)
 {
 #ifdef THREAD_DEBUG
-    LOG_DEBUG3("Lock on %s requested at %s:%d", mutex->name, file, line);
+    if (strcmp (file, __FILE__))
+        LOG_DEBUG3("Lock on %s requested at %s:%d", mutex->name, file, line);
+    if (mutex == NULL)
+        return;
 #endif
     _mutex_lock_c(mutex, file, line);
 #ifdef THREAD_DEBUG
     mutex->lock_start = get_count();
-    mutex->file = (char*)file;
+    mutex->file = strdup (file);
     mutex->line = line;
-    LOG_DEBUG3("Lock on %s acquired at %s:%d", mutex->name, file, line);
+    if (strcmp (file, __FILE__))
+        LOG_DEBUG3("Lock on %s acquired at %s:%d", mutex->name, file, line);
 #endif /* THREAD_DEBUG */
 }
 
 void thread_mutex_unlock_c(mutex_t *mutex, int line, const char *file)
 {
+#ifdef THREAD_DEBUG
+    if (mutex == NULL)
+        return;
+#endif
     _mutex_unlock_c(mutex, file, line);
 #ifdef THREAD_DEBUG
-    LOG_DEBUG4 ("lock %s, at %s:%d lasted %llu", mutex->name, mutex->file,
-            mutex->line, get_count() - mutex->lock_start);
+    if (strcmp (file, __FILE__))
+        LOG_DEBUG4 ("lock %s, at %s:%d lasted %llu", mutex->name, mutex->file,
+                mutex->line, get_count() - mutex->lock_start);
     mutex->file = NULL;
 #endif
 }
@@ -500,6 +521,7 @@ void thread_rwlock_create_c(const char *name, rwlock_t *rwlock, int line, const 
 #endif
 #ifdef THREAD_DEBUG
     rwlock->name = strdup (name);
+    rwlock->lock_count = 0;
     LOG_DEBUG4 ("rwlock %s (%p) created (%s:%d)", rwlock->name, rwlock, file, line);
 #endif
 }
@@ -527,6 +549,12 @@ int thread_rwlock_tryrlock_c(rwlock_t *rwlock, int line, const char *file)
             log_write (thread_log, 1, "thread/", "rwlock", "try rlock error triggered at %p, %s:%d (%d)", rwlock, file, line, ret);
             abort();
         case 0:
+#ifdef THREAD_DEBUG
+    PROTECT_CODE(
+            long x = ++rwlock->lock_count;
+            LOG_DEBUG4("rLock on %s acquired at %s:%d (count %ld)", rwlock->name, file, line, x);
+            );
+#endif
             return 0;
         case EBUSY:
         case EAGAIN:
@@ -558,7 +586,10 @@ void thread_rwlock_rlock_c(rwlock_t *rwlock, int line, const char *file)
         abort();
     }
 #ifdef THREAD_DEBUG
-    LOG_DEBUG3("rLock on %s acquired at %s:%d", rwlock->name, file, line);
+    PROTECT_CODE(
+            long x = ++rwlock->lock_count;
+            LOG_DEBUG4("rLock on %s acquired at %s:%d (count %ld)", rwlock->name, file, line, x);
+            );
 #endif
 }
 
@@ -585,7 +616,10 @@ void thread_rwlock_wlock_c(rwlock_t *rwlock, int line, const char *file)
         abort();
     }
 #ifdef THREAD_DEBUG
-    LOG_DEBUG3("wLock on %s acquired at %s:%d", rwlock->name, file, line);
+    PROTECT_CODE(
+            long x = ++rwlock->lock_count;
+            LOG_DEBUG4("wLock on %s acquired at %s:%d, %ld", rwlock->name, file, line, x);
+    );
 #endif
 }
 
@@ -602,6 +636,12 @@ int thread_rwlock_trywlock_c(rwlock_t *rwlock, int line, const char *file)
             log_write (thread_log, 1, "thread/", "rwlock", "try wlock error triggered at %p, %s:%d (%d)", rwlock, file, line, ret);
             abort();
         case 0:
+#ifdef THREAD_DEBUG
+PROTECT_CODE(
+            long x = ++rwlock->lock_count;
+            LOG_DEBUG4("trywLock on %s acquired at %s:%d (count %ld)", rwlock->name, file, line, x);
+            );
+#endif
             return 0;
         case EBUSY:
         case EAGAIN:
@@ -620,7 +660,10 @@ void thread_rwlock_unlock_c(rwlock_t *rwlock, int line, const char *file)
     }
 
 #ifdef THREAD_DEBUG
-    LOG_DEBUG4 ("unlock %s (%p) at %s:%d", rwlock->name, rwlock, file, line);
+PROTECT_CODE(
+    long x = --rwlock->lock_count;
+    LOG_DEBUG5 ("unlock %s (%p) at %s:%d (count %ld)", rwlock->name, rwlock, file, line, x);
+    );
 #endif
 }
 
@@ -640,7 +683,7 @@ void thread_exit_c(long val, int line, char *file)
             tmutex = (mutex_t *)node->key;
 
             if (tmutex->thread_id == th->thread_id) {
-                LOG_WARN("Thread %d [%s] exiting in file %s line %d, without unlocking mutex [%s]", 
+                LOG_WARN("Thread %d [%s] exiting in file %s line %d, without unlocking mutex [%s]",
                      th->thread_id, th->name, file, line, mutex_to_string(tmutex, name));
             }
 
@@ -686,7 +729,7 @@ void thread_sleep(unsigned long len)
     while (ret != 0 && errno == EINTR) {
         time_sleep.tv_sec = time_remaining.tv_sec;
         time_sleep.tv_nsec = time_remaining.tv_nsec;
-        
+
         ret = nanosleep(&time_sleep, &time_remaining);
     }
 # else
@@ -753,9 +796,9 @@ thread_type *thread_self(void)
         _mutex_unlock(&_threadtree_mutex);
         return NULL;
     }
-    
+
     node = avl_get_first(_threadtree);
-    
+
     while (node) {
         th = (thread_type *)node->key;
 
@@ -763,7 +806,7 @@ thread_type *thread_self(void)
             _mutex_unlock(&_threadtree_mutex);
             return th;
         }
-        
+
         node = avl_get_next(node);
     }
     _mutex_unlock(&_threadtree_mutex);
@@ -772,7 +815,7 @@ thread_type *thread_self(void)
 #ifdef THREAD_DEBUG
     LOG_ERROR("Nonexistant thread alive...");
 #endif
-    
+
     return NULL;
 }
 
@@ -786,7 +829,7 @@ void thread_rename(const char *name)
     th->name = strdup(name);
 }
 
-static void _mutex_lock_c(mutex_t *mutex, const char *file, int line) 
+static void _mutex_lock_c(mutex_t *mutex, const char *file, int line)
 {
     int rc;
 #if _POSIX_C_SOURCE>=200112L
@@ -810,14 +853,11 @@ static void _mutex_lock_c(mutex_t *mutex, const char *file, int line)
             log_write (thread_log, 1, "thread/", "mutex", "last lock at %s:%d", mutex->file,mutex->line);
         abort();
     }
-    mutex->file = file;
-    mutex->line = line;
 }
 
 static void _mutex_unlock_c(mutex_t *mutex, const char *file, int line)
 {
     int rc;
-    mutex->file = NULL;
     rc = pthread_mutex_unlock(&mutex->sys_mutex);
     if (lock_problem_abort && rc)
     {
@@ -897,6 +937,7 @@ static int _free_mutex(void *key)
     if (m && m->file) {
         m->file = NULL;
     }
+    free (m->name);
 
     /* all mutexes are static.  don't need to free them */
 
@@ -988,7 +1029,7 @@ void thread_time_add_ms (struct timespec *ts, unsigned long value)
 }
 
 
-int thread_mtx_create_callback (void **p, int alloc)
+int thread_mtx_create_callback (void **p, const char *filename, size_t line, int alloc)
 {
     mutex_t *mutex;
     if (p == NULL)
@@ -996,7 +1037,7 @@ int thread_mtx_create_callback (void **p, int alloc)
     if (alloc)
     {
         mutex = malloc (sizeof(mutex_t));
-        thread_mutex_create (mutex);
+        thread_mutex_create_c (mutex, line, filename);
         *p = mutex;
     }
     else
@@ -1010,7 +1051,7 @@ int thread_mtx_create_callback (void **p, int alloc)
 }
 
 
-int thread_mtx_lock_callback (void **p, int lock)
+int thread_mtx_lock_callback (void **p, const char *filename, size_t line, int lock)
 {
     mutex_t *mutex;
     if (p == NULL)
@@ -1018,7 +1059,7 @@ int thread_mtx_lock_callback (void **p, int lock)
     mutex = *p;
     if (lock)
     {
-        thread_mutex_lock (mutex);
+        thread_mutex_lock_c (mutex, line, filename);
     }
     else
     {
@@ -1026,3 +1067,51 @@ int thread_mtx_lock_callback (void **p, int lock)
     }
     return 0;
 }
+
+
+int thread_rw_create_callback (void **p, const char *filename, size_t line, int alloc)
+{
+    int rc = -1;
+    if (p)
+    {
+        rwlock_t *rwlock;
+        if (alloc)
+        {
+            rwlock = malloc (sizeof (rwlock_t));
+            thread_rwlock_create_c ("thread-rw", rwlock, line, filename);
+        }
+        else
+        {
+            rwlock = *p;
+            thread_rwlock_destroy (rwlock);
+            free (rwlock);
+            rwlock = NULL;
+        }
+        rc = 0;
+        *p = rwlock;
+    }
+    return rc;
+}
+
+
+int thread_rw_lock_callback (void **p, const char *filename, size_t line, int lock)
+{
+    int rc = -1;
+    if (p)
+    {
+        rc = 0;
+        rwlock_t *rwl = *p;
+        if (lock == THREAD_RWL_RLOCK)
+            thread_rwlock_rlock_c (rwl, line, filename);
+        else if (lock == THREAD_RWL_UNLOCK)
+            thread_rwlock_unlock_c (rwl, line, filename);
+        else if (lock == THREAD_RWL_WLOCK)
+            thread_rwlock_wlock_c (rwl, line, filename);
+        else if (lock == THREAD_RWL_TRYRLOCK)
+            rc = thread_rwlock_tryrlock_c (rwl, line, filename);
+        else if (lock == THREAD_RWL_TRYWLOCK)
+            rc = thread_rwlock_trywlock_c (rwl, line, filename);
+    }
+    return rc;
+}
+

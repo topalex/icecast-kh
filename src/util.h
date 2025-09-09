@@ -3,7 +3,8 @@
  * This program is distributed under the GNU General Public License, version 2.
  * A copy of this license is included with this source.
  *
- * Copyright 2000-2004, Jack Moffitt <jack@xiph.org, 
+ * Copyright 2010-2022, Karl Heyes <karl@kheyes.plus.com>
+ * Copyright 2000-2004, Jack Moffitt <jack@xiph.org>,
  *                      Michael Smith <msmith@xiph.org>,
  *                      oddsock <oddsock@xiph.org>,
  *                      Karl Heyes <karl@xiph.org>
@@ -31,6 +32,7 @@ char *util_get_path_from_uri(char *uri);
 char *util_get_path_from_normalised_uri(const char *uri, int use_admin);
 char *util_normalise_uri(const char *uri);
 char *util_base64_encode(const char *data);
+char *util_base64_encode_len (const char *data, int len);
 char *util_base64_decode(const char *input);
 char *util_bin_to_hex(unsigned char *data, int len);
 
@@ -80,9 +82,11 @@ typedef struct _cache_contents
 
     void *deletions[9];
     int  deletions_count;
+    unsigned int flags_cmp;
     char                    *filename;
 } cache_file_contents;
 
+#define CACHED_IGNORECASE               1
 
 util_dict *util_dict_new(void);
 void util_dict_free(util_dict *dict);
@@ -111,9 +115,11 @@ int get_line(FILE *file, char *buf, size_t siz);
 int util_expand_pattern (const char *mount, const char *pattern, char *buf, unsigned int *len_p);
 
 void cached_file_init (cache_file_contents *cache, const char *filename, cachefile_add_func add, cachefile_compare_func compare);
+void cached_file_settings (cache_file_contents *cache, unsigned int flags);
 
 int cached_treenode_free (void*x);
-int cached_pattern_compare (const char *value, const char *pattern);
+int cached_pattern_match (void *arg, const char *value, const char *pattern);
+#define cached_pattern_compare(V,P) cached_pattern_match(NULL,V,P)
 
 void cached_file_clear (cache_file_contents *cache);
 int cached_pattern_search (cache_file_contents *cache, const char *line, time_t now);

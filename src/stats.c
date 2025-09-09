@@ -3,7 +3,8 @@
  * This program is distributed under the GNU General Public License, version 2.
  * A copy of this license is included with this source.
  *
- * Copyright 2000-2004, Jack Moffitt <jack@xiph.org, 
+ * Copyright 2010-2022, Karl Heyes <karl@kheyes.plus.com>
+ * Copyright 2000-2004, Jack Moffitt <jack@xiph.org>,
  *                      Michael Smith <msmith@xiph.org>,
  *                      oddsock <oddsock@xiph.org>,
  *                      Karl Heyes <karl@xiph.org>
@@ -70,9 +71,9 @@ typedef struct _stats_node_tag
 
 typedef struct _stats_event_tag
 {
-    char *source;
-    char *name;
-    char *value;
+    const char *source;
+    const char *name;
+    const char *value;
     int  flags;
     int  action;
 
@@ -121,7 +122,6 @@ static int _compare_stats(void *a, void *b, void *arg);
 static int _compare_source_stats(void *a, void *b, void *arg);
 static int _free_stats(void *key);
 static int _free_source_stats(void *key);
-static int _free_source_stats_wrapper (void *key);
 static stats_node_t *_find_node(const avl_tree *tree, const char *name);
 static stats_source_t *_find_source(avl_tree *tree, const char *source);
 static void process_event (stats_event_t *event);
@@ -133,9 +133,9 @@ unsigned int throttle_sends;
 /* simple helper function for creating an event */
 static void build_event (stats_event_t *event, const char *source, const char *name, const char *value)
 {
-    event->source = (char *)source;
-    event->name = (char *)name;
-    event->value = (char *)value;
+    event->source = source;
+    event->name = name;
+    event->value = value;
     event->flags = STATS_PUBLIC;
     if (source) event->flags |= STATS_SLAVE;
     if (value)
@@ -191,7 +191,7 @@ void stats_shutdown(void)
 
     _stats_running = 0;
 
-    avl_tree_free(_stats.source_tree, _free_source_stats_wrapper);
+    avl_tree_free(_stats.source_tree, _free_source_stats);
     avl_tree_free(_stats.global_tree, _free_stats);
     thread_mutex_destroy (&_stats.listeners_lock);
 }
@@ -225,7 +225,7 @@ void stats_event(const char *source, const char *name, const char *value)
                 source?source:"global", name, value);
         return;
     }
-    build_event (&event, source, name, (char *)value);
+    build_event (&event, source, name, value);
     process_event (&event);
 }
 
@@ -329,14 +329,18 @@ char *stats_get_value(const char *source, const char *name)
 }
 
 
-char *stats_retrieve (stats_handle_t handle, const char *name)
+const char *stats_retrieve_nocopy (stats_handle_t handle, const char *name)
 {
-    char *v = NULL;
     stats_source_t *src_stats = (stats_source_t *)handle;
     stats_node_t *stats = _find_node (src_stats->stats_tree, name);
+    return stats ? stats->value : NULL;
+}
 
-    if (stats) v =  strdup (stats->value);
-    return v;
+
+char *stats_retrieve (stats_handle_t handle, const char *name)
+{
+    const char *str = stats_retrieve_nocopy (handle, name);
+    return str ? strdup (str) : NULL;
 }
 
 
@@ -358,8 +362,8 @@ void stats_event_add(const char *source, const char *name, unsigned long value)
 
     if (value == 0)
         return;
-    build_event (&event, source, name, buffer);
     snprintf (buffer, VAL_BUFSIZE, "%ld", value);
+    build_event (&event, source, name, buffer);
     event.action = STATS_EVENT_ADD;
     /* DEBUG2("%s on %s", name, source==NULL?"global":source); */
     process_event (&event);
@@ -372,9 +376,9 @@ void stats_event_sub(const char *source, const char *name, unsigned long value)
 
     if (value == 0)
         return;
-    build_event (&event, source, name, buffer);
     /* DEBUG2("%s on %s", name, source==NULL?"global":source); */
     snprintf (buffer, VAL_BUFSIZE, "%ld", value);
+    build_event (&event, source, name, buffer);
     event.action = STATS_EVENT_SUB;
     process_event (&event);
 }
@@ -449,6 +453,8 @@ static void modify_node_event (stats_node_t *node, stats_event_t *event)
 {
     if (node == NULL || event == NULL)
         return;
+    char *nv = NULL;
+
     if (event->action & STATS_EVENT_HIDDEN)
     {
         node->flags = event->flags;
@@ -485,11 +491,11 @@ static void modify_node_event (stats_node_t *node, stats_event_t *event)
             default:
                 break;
         }
-        snprintf (event->value, VAL_BUFSIZE, "%" PRId64, value);
+        nv = malloc (VAL_BUFSIZE);
+        snprintf (nv, VAL_BUFSIZE, "%" PRId64, value);
     }
-    if (node->value)
-        free (node->value);
-    node->value = strdup (event->value);
+    free (node->value);
+    node->value = nv ? nv : strdup (event->value);
 
     if (node->flags & STATS_REGULAR)
         node->last_reported = 0;
@@ -574,9 +580,9 @@ static void process_source_stat (stats_source_t *src_stats, stats_event_t *event
     {
         avl_tree_unlock (src_stats->stats_tree);
         avl_tree_wlock (_stats.source_tree);
-        avl_tree_wlock (src_stats->stats_tree);
-        avl_delete (_stats.source_tree, (void *)src_stats, _free_source_stats);
+        avl_delete (_stats.source_tree, (void *)src_stats, NULL);
         avl_tree_unlock (_stats.source_tree);
+        _free_source_stats (src_stats);
         return;
     }
     /* change source flags status */
@@ -646,11 +652,14 @@ static void process_source_event (stats_event_t *event)
         int fallback_stream = 0;
         avl_tree_wlock (snode->stats_tree);
         fallback_stream = _find_node (snode->stats_tree, "fallback") == NULL ? 1 : 0;
+        avl_tree_unlock (snode->stats_tree);
         if (fallback_stream)
-            avl_delete(_stats.source_tree, (void *)snode, _free_source_stats);
+            avl_delete(_stats.source_tree, (void *)snode, NULL);
         else
-            avl_tree_unlock (snode->stats_tree);
+            snode = NULL;
         avl_tree_unlock (_stats.source_tree);
+        if (snode)
+            _free_source_stats (snode);
         return;
     }
     avl_tree_wlock (snode->stats_tree);
@@ -812,40 +821,6 @@ static void process_event (stats_event_t *event)
 }
 
 
-static int _append_to_bufferv (refbuf_t *refbuf, int max_len, const char *fmt, va_list ap)
-{
-    char *buf = (char*)refbuf->data + refbuf->len;
-    int len = max_len - refbuf->len;
-    int ret;
-    va_list vl;
-
-    va_copy (vl, ap);
-    if (len <= 0)
-        return -1;
-    ret = vsnprintf (buf, len, fmt, vl);
-    if (ret < 0 || ret >= len)
-        return -1;
-    refbuf->len += ret;
-    return ret;
-}
-
-static int _append_to_buffer (refbuf_t *refbuf, int max_len, const char *fmt, ...)
-{
-    int ret;
-    va_list va;
-
-    va_start (va, fmt);
-    ret = _append_to_bufferv (refbuf, max_len, fmt, va);
-    va_end(va);
-    if (refbuf->len == 0) // trap for stupid case, report and then ignore it
-    {
-        ERROR1 ("message too big to append, ignoring \"%.25s...\"", refbuf->data);
-        return 0;
-    }
-    return ret;
-}
-
-
 static void _add_node_to_stats_client (client_t *client, refbuf_t *refbuf)
 {
     if (refbuf->len)
@@ -889,7 +864,7 @@ static void _add_stats_to_stats_client (client_t *client, const char *fmt, va_li
             /* lets see if we can append to an existing block */
             if (r->len < 4000)
             {
-                int written = _append_to_bufferv (r, 4096, fmt, ap);
+                int written = refbuf_appendv (r, 4096, fmt, ap);
                 if (written > 0)
                 {
                     listener->content_len += written;
@@ -899,7 +874,7 @@ static void _add_stats_to_stats_client (client_t *client, const char *fmt, va_li
         }
         r = refbuf_new (4096);
         r->len = 0;
-        if (_append_to_bufferv (r, 4096, fmt, ap) < 0)
+        if (refbuf_appendv (r, 4096, fmt, ap) < 0)
         {
             WARN1 ("stat details are too large \"%s\"", fmt);
             refbuf_release (r);
@@ -960,17 +935,16 @@ static xmlNodePtr _dump_stats_to_doc (xmlNodePtr root, const char *show_mount, i
 
 
 /* factoring out code for stats loops
- * this function copies all stats to queue, and registers 
+ * this function copies all stats to queue, and registers
  */
 static void _register_listener (client_t *client)
 {
     event_listener_t *listener = client->shared_data;
     avl_node *node;
-    worker_t *worker = client->worker;
     stats_event_t stats_count;
     refbuf_t *refbuf, *biglist = NULL, **full_p = &biglist, *last = NULL;
     size_t size = 8192, len = 0;
-    char buffer[20];
+    char buffer[VAL_BUFSIZE] = "";
 
     build_event (&stats_count, NULL, "stats_connections", buffer);
     stats_count.action = STATS_EVENT_INC;
@@ -986,7 +960,7 @@ static void _register_listener (client_t *client)
     refbuf = refbuf_new (size);
     refbuf->len = 0;
 
-    _append_to_buffer (refbuf, size, "HTTP/1.0 200 OK\r\nCapability: streamlist stats\r\n\r\n");
+    refbuf_append (refbuf, size, "HTTP/1.0 200 OK\r\nCapability: streamlist stats\r\n\r\n");
 
     /* now the global stats */
     avl_tree_rlock (_stats.global_tree);
@@ -997,7 +971,7 @@ static void _register_listener (client_t *client)
 
         if (stat->flags & listener->mask)
         {
-            while (_append_to_buffer (refbuf, size, "EVENT global %s %s\n", stat->name, stat->value) < 0)
+            while (refbuf_append (refbuf, size, "EVENT global %s %s\n", stat->name, stat->value) < 0)
             {
                 *full_p = last = refbuf;
                 full_p = &refbuf->next;
@@ -1022,7 +996,7 @@ static void _register_listener (client_t *client)
             const char *type = "audio/mpeg";
             if (ct)
                 type = ct->value;
-            while (_append_to_buffer (refbuf, size, "NEW %s %s\n", type, snode->source) < 0)
+            while (refbuf_append (refbuf, size, "NEW %s %s\n", type, snode->source) < 0)
             {
                 *full_p = last = refbuf;
                 full_p = &refbuf->next;
@@ -1033,7 +1007,7 @@ static void _register_listener (client_t *client)
         }
         node = avl_get_next(node);
     }
-    while (_append_to_buffer (refbuf, size, "INFO full list end\n") < 0)
+    while (refbuf_append (refbuf, size, "INFO full list end\n") < 0)
     {
         *full_p = last = refbuf;
         full_p = &refbuf->next;
@@ -1061,7 +1035,7 @@ static void _register_listener (client_t *client)
                     if (strcmp (stat->name, "metadata_updated") == 0)
                         metadata_stat = stat;
                     else
-                        while (_append_to_buffer (refbuf, size, "EVENT %s %s %s\n", snode->source, stat->name, stat->value) < 0)
+                        while (refbuf_append (refbuf, size, "EVENT %s %s %s\n", snode->source, stat->name, stat->value) < 0)
                         {
                             *full_p = last = refbuf;
                             full_p = &refbuf->next;
@@ -1073,7 +1047,7 @@ static void _register_listener (client_t *client)
                 node2 = avl_get_next (node2);
             }
             while (metadata_stat &&
-                    _append_to_buffer (refbuf, size, "EVENT %s %s %s\n", snode->source, metadata_stat->name, metadata_stat->value) < 0)
+                    refbuf_append (refbuf, size, "EVENT %s %s %s\n", snode->source, metadata_stat->name, metadata_stat->value) < 0)
             {
                 *full_p = last = refbuf;
                 full_p = &refbuf->next;
@@ -1106,9 +1080,7 @@ static void _register_listener (client_t *client)
     listener->recent_block = last;
     thread_mutex_unlock (&_stats.listeners_lock);
 
-    client->schedule_ms = 0;
-    client->flags |= CLIENT_ACTIVE;
-    worker_wakeup (worker);
+    client_add_incoming (client);
 }
 
 
@@ -1132,7 +1104,7 @@ static void stats_client_release (client_t *client)
     if (match)
         *trail = match->next;
     else
-        WARN0 ("odd, no stats client details in collection"); 
+        WARN0 ("odd, no stats client details in collection");
     thread_mutex_unlock (&_stats.listeners_lock);
 
     clear_stats_queue (client);
@@ -1170,9 +1142,12 @@ void stats_add_listener (client_t *client, int mask)
 int stats_transform_xslt (client_t *client, const char *uri)
 {
     xmlDocPtr doc;
-    char *xslpath = util_get_path_from_normalised_uri (uri, 0);
     const char *mount = httpp_get_query_param (client->parser, "mount");
     int ret;
+
+    config_get_config ();
+    char *xslpath = util_get_path_from_normalised_uri (uri, 0);
+    config_release_config ();
 
     if (mount == NULL && client->server_conn->shoutcast_mount && strcmp (uri, "/7.xsl") == 0)
         mount = client->server_conn->shoutcast_mount;
@@ -1218,7 +1193,7 @@ xmlDocPtr stats_get_xml (int flags, const char *show_mount)
             finfo.flags = FS_FALLBACK;
             finfo.mount = (char*)show_mount;
             finfo.limit = 0;
-            finfo.fallback = NULL;
+            finfo.override = NULL;
 
             fserve_list_clients_xml (node, &finfo);
         }
@@ -1248,30 +1223,23 @@ static int _free_stats(void *key)
     free(node->value);
     free(node->name);
     free(node);
-    
+
     return 1;
 }
 
-static int _free_source_stats(void *key)
+static int _free_source_stats (void *key)
 {
     stats_source_t *node = (stats_source_t *)key;
     stats_listener_send (node->flags, "DELETE %s\n", node->source);
     DEBUG1 ("delete source node %s", node->source);
-    avl_tree_unlock (node->stats_tree);
     avl_tree_free(node->stats_tree, _free_stats);
     free(node->source);
+    memset (node, 0, sizeof (*node));
     free(node);
 
     return 1;
 }
 
-static int _free_source_stats_wrapper (void *key)
-{
-    stats_source_t *node = (stats_source_t *)key;
-    avl_tree_rlock (node->stats_tree);
-    _free_source_stats (node);
-    return 1;
-}
 
 /* return a list of blocks which contain lines of text. Each line is a mountpoint
  * reference that a slave will use for relaying.  The prepend setting is to indicate
@@ -1340,19 +1308,28 @@ void stats_purge (time_t mark)
         snode = avl_get_next (snode);
         if (src->source[0] == '/')
         {
+            avl_tree_wlock (src->stats_tree);
             if (src->updated < mark)
             {
-                avl_tree_wlock (src->stats_tree);
-                avl_delete (_stats.source_tree, src, _free_source_stats);
+                avl_delete (_stats.source_tree, src, NULL);
+                avl_tree_unlock (src->stats_tree);
+                _free_source_stats (src);
             }
+            else
+                avl_tree_unlock (src->stats_tree);
             continue;
         }
-        if (fserve_contains (src->source) < 0)
+        int present = fserve_contains (src->source);
+        if (present < 0)
+            break;      // jump out for now, purge next time around
+        if (present == 0)
         {
             /* no source_t and no fallback file stat, so delete */
             DEBUG1 ("dropping unreferenced stats for %s", src->source);
             avl_tree_wlock (src->stats_tree);
-            avl_delete (_stats.source_tree, src, _free_source_stats);
+            avl_delete (_stats.source_tree, src, NULL);
+            avl_tree_unlock (src->stats_tree);
+            _free_source_stats (src);
         }
     }
     avl_tree_unlock (_stats.source_tree);
@@ -1371,7 +1348,6 @@ void stats_global_calc (time_t now)
     connection_stats ();
 
     snprintf (buf1, sizeof(buf1), "%" PRIu64, (int64_t)global.clients);
-
     snprintf (buf2, sizeof(buf2), "%" PRIu64, (int64_t)global.listeners);
     snprintf (buf3, sizeof(buf3), "%" PRIu64,
             (int64_t)global_getrate_avg (global.out_bitrate) * 8 / 1024);
@@ -1380,6 +1356,7 @@ void stats_global_calc (time_t now)
     build_event (&clients, NULL, "clients", buf1);
     clients.flags |= STATS_COUNTERS;
     process_event (&clients);
+
     build_event (&listeners, NULL, "listeners", buf2);
     listeners.flags |= STATS_COUNTERS;
     process_event (&listeners);
@@ -1429,9 +1406,9 @@ stats_handle_t stats_handle (const char *mount)
 
         avl_insert (_stats.source_tree, (void *)src_stats);
     }
-    src_stats->updated = (time_t)(LONG_MAX);
     avl_tree_wlock (src_stats->stats_tree);
     avl_tree_unlock (_stats.source_tree);
+    src_stats->updated = (time_t)(LONG_MAX);
 
     return (stats_handle_t)src_stats;
 }
@@ -1478,7 +1455,7 @@ void stats_flush (stats_handle_t handle)
 }
 
 
-// assume source stats are write locked 
+// assume source stats are write locked
 void stats_set (stats_handle_t handle, const char *name, const char *value)
 {
     if (handle)
@@ -1533,7 +1510,7 @@ void stats_set_args (stats_handle_t handle, const char *name, const char *format
 void stats_set_expire (stats_handle_t handle, time_t mark)
 {
     stats_source_t *src_stats = (stats_source_t *)handle;
-    
+
     if (src_stats)
         src_stats->updated = mark;
 }

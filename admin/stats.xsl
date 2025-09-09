@@ -7,7 +7,7 @@
 <html>
 <head>
 <title>Icecast Streaming Media Server</title>
-<link rel="stylesheet" type="text/css" href="/style.css" />
+<link rel="stylesheet" type="text/css" href="../style.css" />
 </head>
 <body bgcolor="#000" topmargin="0" leftmargin="0" rightmargin="0" bottommargin="0">
 
@@ -18,14 +18,14 @@
 <!--global server stats-->
 <div class="roundcont">
 <div class="roundtop">
-<img src="/images/corner_topleft.jpg" class="corner" style="display: none" />
+
 </div>
 <div class="newscontent">
 <h3>Global Server Stats</h3>
 <table border="0" cellpadding="4">
 <xsl:for-each select="/icestats">
 <xsl:for-each select="*">
-<xsl:if test = "name()!='source'"> 
+<xsl:if test = "name()!='source'">
 <tr>
 	<td width="130"><xsl:value-of select="name()" /></td>
 	<td class="streamdata"><xsl:value-of select="." /></td>
@@ -36,7 +36,7 @@
 </table>
 </div>
 <div class="roundbottom">
-<img src="/images/corner_bottomleft.jpg" class="corner" style="display: none" />
+
 </div>
 </div>
 <br />
@@ -47,7 +47,7 @@
 <xsl:for-each select="source">
 <div class="roundcont">
 <div class="roundtop">
-<img src="/images/corner_topleft.jpg" class="corner" style="display: none" />
+
 </div>
 <div class="newscontent">
 <div class="streamheader">
@@ -58,7 +58,7 @@
             <td><h3>Mount Point <xsl:value-of select="@mount" /></h3></td>
             <xsl:choose>
                 <xsl:when test="authenticator">
-                    <td align="right"><a class="auth" href="/auth.xsl">Login</a></td>
+                    <td align="right"><a class="auth" href="../auth.xsl">Login</a></td>
                 </xsl:when>
                 <xsl:otherwise>
                     <td align="right"> <a href="{@mount}.m3u">M3U</a> <a href="{@mount}.xspf">XSPF</a></td>
@@ -93,7 +93,7 @@
 </table>
 </div>
 <div class="roundbottom">
-<img src="/images/corner_bottomleft.jpg" class="corner" style="display: none" />
+
 </div>
 </div>
 <br />

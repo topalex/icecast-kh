@@ -4,7 +4,7 @@
  * A copy of this license is included with this source.
  *
  * Copyright 2009-2010,  Karl Heyes <karl@xiph.org>
- * Copyright 2009-2018,  Karl Heyes <karl@kheyes.plus.com>
+ * Copyright 2009-2022,  Karl Heyes <karl@kheyes.plus.com>
  */
 
 /* mpeg.c
@@ -21,15 +21,6 @@ struct mpeg_sync;
 
 typedef uint8_t frame_type_t;
 
-#define FORMAT_TYPE_UNDEFINED       0   /* No format determined */
-#define FORMAT_TYPE_OGG             1
-#define FORMAT_TYPE_AAC             2   // for AAC/ADTS style content
-#define FORMAT_TYPE_MPEG            3   // for MPEG1/2/ADTS type content
-#define FORMAT_TYPE_MP4             4
-#define FORMAT_TYPE_EBML            5
-#define FORMAT_TYPE_USAC            6   // USAC/LOAS framed aac
-
-
 typedef struct sync_callback_t
 {
     void *callback_key;
@@ -43,14 +34,14 @@ typedef struct mpeg_sync
     uint32_t mask;
     uint32_t match;
 
-    unsigned short resync_count;
+    uint32_t resync_count;
+    uint32_t sample_count;
+
     unsigned char marker;
     frame_type_t type;
 
     uint32_t tag_len;
     unsigned char *tag_data;
-
-    uint64_t sample_count;
 
     int (*process_frame) (struct mpeg_sync *mp, sync_callback_t *cb, unsigned char *p, int len);
 

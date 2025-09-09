@@ -3,7 +3,8 @@
  * This program is distributed under the GNU General Public License, version 2.
  * A copy of this license is included with this source.
  *
- * Copyright 2000-2004, Jack Moffitt <jack@xiph.org, 
+ * Copyright 2010-2022, Karl Heyes <karl@kheyes.plus.com>,
+ * Copyright 2000-2004, Jack Moffitt <jack@xiph.org>,
  *                      Michael Smith <msmith@xiph.org>,
  *                      oddsock <oddsock@xiph.org>,
  *                      Karl Heyes <karl@xiph.org>
@@ -20,9 +21,10 @@
 
 typedef struct _client_tag client_t;
 typedef struct _worker_t worker_t;
+struct _config_http_header_tag;
 
-#include "cfgfile.h"
 #include "connection.h"
+#include "cfgfile.h"
 #include "refbuf.h"
 #include "httpp/httpp.h"
 #include "compat.h"
@@ -33,18 +35,20 @@ struct _worker_t
     int running;
     int count, pending_count;
     int move_allocations;
-    spin_t lock;
+    mutex_t lock;
     FD_t wakeup_fd[2];
-
-    client_t *pending_clients;
-    client_t **pending_clients_tail,
-             *clients;
-    client_t **last_p;
-    thread_type *thread;
     struct timespec current_time;
     uint64_t time_ms;
-    uint64_t wakeup_ms;
+
+    client_t *fast_clients;
+    client_t **fast_tailp;
+    client_t *pending_clients;
+    client_t **pending_tailp;
+    client_t *clients;
+    client_t **last_p;
+
     struct _worker_t *next;
+    thread_type *thread;
 };
 
 
@@ -61,13 +65,12 @@ struct _client_functions
 struct _client_tag
 {
     uint64_t schedule_ms;
-    char *wakeup;
 
     /* various states the client could be in */
-    unsigned int flags;
+    uint32_t flags;
 
     /* position in first buffer */
-    unsigned int pos;
+    uint32_t pos;
 
     client_t *next_on_worker;
 
@@ -85,6 +88,9 @@ struct _client_tag
 
     /* the clients connection */
     connection_t connection;
+
+    /* trap for excessive fast client reschedule */
+    unsigned char fast_count;
 
     /* the client's http headers */
     http_parser_t *parser;
@@ -115,7 +121,7 @@ struct _client_tag
 
     uint64_t timer_start;
     uint64_t counter;
-    uint64_t aux_data;
+    uintptr_t aux_data;
 
     /* function to call to release format specific resources */
     void (*free_client_data)(struct _client_tag *client);
@@ -125,9 +131,11 @@ struct _client_tag
     unsigned int throttle;
 };
 
+
+int  client_send_m3u (client_t *client, const char *path);
+
 void client_register (client_t *client);
 void client_destroy(client_t *client);
-int  client_add_cors (client_t *client, char *buf, int remain);
 int  client_send_options(client_t *client);
 int  client_send_501(client_t *client);
 int  client_send_416(client_t *client);
@@ -139,6 +147,7 @@ int  client_send_400(client_t *client, const char *message);
 int  client_send_302(client_t *client, const char *location);
 int  client_send_bytes (client_t *client, const void *buf, unsigned len);
 int  client_send_buffer_callback (client_t *client, int(*callback)(client_t*));
+int  client_send_buffer (client_t *client);
 int  client_read_bytes (client_t *client, void *buf, unsigned len);
 void client_set_queue (client_t *client, refbuf_t *refbuf);
 int  client_compare (void *compare_arg, void *a, void *b);
@@ -147,7 +156,7 @@ const char *client_keepalive_header (client_t *client);
 
 int  client_change_worker (client_t *client, worker_t *dest_worker);
 void client_add_worker (client_t *client);
-void client_add_incoming (client_t *client);
+int  client_add_incoming (client_t *client);
 worker_t *worker_selected (void);
 void worker_balance_trigger (time_t now);
 void workers_adjust (int new_count);
@@ -155,6 +164,8 @@ void worker_wakeup (worker_t *worker);
 void worker_logger_init (void);
 void worker_logger (int stop);
 int  is_worker_incoming (worker_t *w);
+
+void logger_commits (int id);
 
 
 /* client flags bitmask */
@@ -167,7 +178,7 @@ int  is_worker_incoming (worker_t *w);
 #define CLIENT_SKIP_ACCESSLOG       (1<<6)
 #define CLIENT_HAS_MOVED            (1<<7)
 #define CLIENT_IP_BAN_LIFT          (1<<8)
-#define CLIENT_META_INSTREAM        (1<<9)
+
 #define CLIENT_HIJACKER             (1<<10)
 #define CLIENT_RANGE_END            (1<<11)
 #define CLIENT_KEEPALIVE            (1<<12)

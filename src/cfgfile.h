@@ -3,7 +3,8 @@
  * This program is distributed under the GNU General Public License, version 2.
  * A copy of this license is included with this source.
  *
- * Copyright 2000-2004, Jack Moffitt <jack@xiph.org, 
+ * Copyright 2010-2022, Karl Heyes <karl@kheyes.plus.com>,
+ * Copyright 2000-2004, Jack Moffitt <jack@xiph.org>,
  *                      Michael Smith <msmith@xiph.org>,
  *                      oddsock <oddsock@xiph.org>,
  *                      Karl Heyes <karl@xiph.org>
@@ -24,12 +25,16 @@
 
 struct _mount_proxy;
 struct ice_config_tag;
+struct _config_options;
 typedef struct _listener_t listener_t;
 
 #include "avl/avl.h"
+#include "log/log.h"
 #include "auth.h"
 #include "compat.h"
+#include "format.h"
 
+extern uint64_t config_updated;
 
 typedef struct _redirect_host
 {
@@ -65,7 +70,7 @@ typedef struct error_log
     int display;
     long size;
     unsigned duration;
-    int level;
+    log_levels_t level;
 } error_log;
 
 typedef struct playlist_log
@@ -94,6 +99,38 @@ typedef struct _config_options {
     struct _config_options *next;
 } config_options_t;
 
+
+typedef struct _config_http_header_tag {
+    /* link to the next list element */
+    struct _config_http_header_tag *next;
+
+    unsigned int flags;
+    struct
+    {
+        /* filters */
+        char *status;
+
+        /* name and value of the header */
+        char *name;
+        char *value;
+
+        void *callback;
+    } hdr;
+
+} ice_config_http_header_t;
+
+
+typedef struct _fbinfo
+{
+    int flags;
+    format_type_t type;
+    uint64_t limit;
+    uint64_t fsize;
+    char *mount;
+    char *override;
+} fbinfo;
+
+
 typedef struct _mount_proxy {
     char *mountname; /* The mountpoint this proxy is used for */
 
@@ -107,14 +144,16 @@ typedef struct _mount_proxy {
     /* whether to allow matching files to work with http ranges */
     int file_seekable;
 
+    int priority;
+
     int fallback_when_full; /* switch new listener to fallback source
                                when max listeners reached */
     /* Max bandwidth (kbps)  for this mountpoint only. -1 (default) is not specified */
     int64_t max_bandwidth;
 
-    int max_listeners; /* Max listeners for this mountpoint only. -1 to not 
+    int max_listeners; /* Max listeners for this mountpoint only. -1 to not
                           limit here (i.e. only use the global limit) */
-    char *fallback_mount; /* Fallback mountname */
+    fbinfo fallback;    // fallback reference details
 
     int fallback_override; /* When this source arrives, do we steal back
                               clients from the fallback? */
@@ -125,26 +164,31 @@ typedef struct _mount_proxy {
     uint32_t burst_size;
     uint32_t min_queue_size;     /* minimum length of queue */
     uint32_t queue_size_limit;
+    uint32_t _refcount;
     int hidden; /* Do we list this on the xsl pages */
     unsigned int source_timeout;  /* source timeout in seconds */
     char *charset;  /* character set if not utf8 */
     int allow_chunked; /* allow chunked transfers */
     int mp3_meta_interval; /* outgoing per-stream metadata interval */
     int max_send_size;
+    int hijack;                 // an authenticated source can hijack and exist stream
     int filter_theora; /* prevent theora pages getting queued */
     int url_ogg_meta; /* enable to allow updates via url requests for ogg */
     int ogg_passthrough; /* enable to prevent the ogg stream being rebuilt */
     int admin_comments_only; /* enable to only show comments set from the admin page */
     int skip_accesslog;         /* skip logging client to access log */
     int intro_skip_replay;      /* duration to cache IPs, for intro playing */
+    int linger_duration;        /* duration to keep source around */
 
     int64_t limit_rate;
 
     /* duration (secs) for mountpoint to be kept reserved after source client exits */
     int wait_time;
 
+    ice_config_http_header_t *http_headers;
     char *auth_type; /* Authentication type */
     struct auth_tag *auth;
+    char *listenurl;
     char *cluster_password;
     config_options_t *auth_options; /* Options for this type */
     char *on_connect;
@@ -184,7 +228,7 @@ struct xforward_entry
 };
 
 
-struct _listener_t 
+struct _listener_t
 {
     struct _listener_t *next;
     int refcount;
@@ -193,7 +237,6 @@ struct _listener_t
     char *shoutcast_mount;
     int qlen;
     int shoutcast_compat;
-    int ssl;
     int so_sndbuf;
     int so_mss;
 };
@@ -213,9 +256,12 @@ typedef struct _relay_server_host
     char *ip;
     char *bind;
     char *mount;
+    ice_config_http_header_t *http_hdrs;
+    time_t    skip_until;
+    int priority;
     int port;
     int timeout;
-    int skip;
+    uint8_t    secure;
 } relay_server_host;
 
 
@@ -224,12 +270,15 @@ typedef struct _relay_server
     struct _relay_server *new_details;
     struct source_tag *source;
     time_t updated;
+    time_t start;
     int interval;
     int run_on;
     unsigned char type;
     unsigned char flags;
     char *localmount;
+    ice_config_http_header_t *http_hdrs;
     relay_server_host *hosts, *in_use;
+    time_t recheck_hosts;
     char *username;
     char *password;
 } relay_server;
@@ -305,6 +354,7 @@ typedef struct ice_config_tag
 
     mount_proxy *mounts;
     avl_tree *mounts_tree;
+    ice_config_http_header_t *http_headers;
 
     char *server_id;
     char *base_dir;
@@ -339,6 +389,7 @@ typedef struct ice_config_tag
 
 typedef struct {
     rwlock_t config_lock;
+    mutex_t mount_lock;
 } ice_config_locks;
 
 void config_initialize(void);
@@ -351,7 +402,12 @@ void config_set_config (ice_config_t *new_config, ice_config_t *old_config);
 listener_t *config_clear_listener (listener_t *listener);
 relay_server *config_clear_relay (relay_server *relay);
 void config_clear(ice_config_t *config);
+void config_clear_mount (mount_proxy *mountinfo, int log);
+#define config_release_mount(x) config_clear_mount(x,0)
+int config_mount_ref (mount_proxy *mountinfo, int inc);
+mount_proxy *config_lock_mount (ice_config_t *config, const char *mount);
 mount_proxy *config_find_mount (ice_config_t *config, const char *mount);
+int config_http_copy (ice_config_http_header_t *src, ice_config_http_header_t **dest);
 void config_xml_parse_failure (void*x,  xmlErrorPtr error);
 int config_qsizing_conv_a2n (const char *str, uint32_t *p);
 
@@ -359,7 +415,8 @@ int config_rehash(void);
 
 ice_config_locks *config_locks(void);
 
-ice_config_t *config_get_config(void);
+ice_config_t *config_get_config_c(const char *file, int line);
+#define config_get_config()     config_get_config_c(__FILE__,__LINE__)
 ice_config_t *config_grab_config(void);
 void config_release_config(void);
 

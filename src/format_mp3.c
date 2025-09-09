@@ -4,7 +4,7 @@
  * This program is distributed under the GNU General Public License, version 2.
  * A copy of this license is included with this source.
  *
- * Copyright 2010-2019, Karl Heyes <karl@kheyes.plus.com>,
+ * Copyright 2010-2022, Karl Heyes <karl@kheyes.plus.com>,
  * Copyright 2000-2004, Jack Moffitt <jack@xiph.org>,
  *                      Michael Smith <msmith@xiph.org>,
  *                      oddsock <oddsock@xiph.org>,
@@ -55,7 +55,7 @@ static void format_mp3_free_plugin(format_plugin_t *plugin, client_t *client);
 static refbuf_t *mp3_get_filter_meta (source_t *source);
 static refbuf_t *mp3_get_no_meta (source_t *source);
 
-static int  format_mp3_create_client_data (format_plugin_t *plugin, client_t *client);
+static int  format_mp3_create_client_data (format_plugin_t *plugin, ice_http_t *, client_t *client);
 static void free_mp3_client_data (client_t *client);
 static int  format_mp3_write_buf_to_client(client_t *client);
 static int  write_mpeg_buf_to_client (client_t *client);
@@ -161,9 +161,21 @@ int format_mp3_get_plugin (format_plugin_t *plugin)
     plugin->qblock_copy = format_mpeg_qblock_copy;
     plugin->_state = state;
     state->max_send_size = 0;
-    state->interval = -1;
+    state->icy_interval = -1;
     INFO1 ("Created format details for %s", plugin->mount);
     return 0;
+}
+
+
+static void free_icysource_client_data (client_t *client)
+{
+   if (client == NULL || client->format_data == NULL) return;
+
+   icy_client_in *in_icy = client->format_data;
+   mpeg_cleanup (&in_icy->sync);
+   refbuf_release (in_icy->read_data);
+   free (in_icy);
+   client->format_data = NULL;
 }
 
 
@@ -174,15 +186,8 @@ static void mpeg_apply_client (format_plugin_t *plugin, client_t *client)
     const char *metadata;
     refbuf_t *meta;
 
-    source_mp3->interval = -1;
-    source_mp3->offset = 0;
-    source_mp3->build_metadata_len = 0;
-
     metadata_blk_release (source_mp3->metadata);
     source_mp3->metadata = NULL;
-    refbuf_release (source_mp3->read_data);
-    source_mp3->read_data = NULL;
-    source_mp3->read_count = 0;
     free (plugin->contenttype);
     plugin->contenttype = NULL;
 
@@ -203,38 +208,44 @@ static void mpeg_apply_client (format_plugin_t *plugin, client_t *client)
     memcpy (meta->data, "\001StreamTitle='';", 17);
     source_mp3->metadata = metadata_blk_copy (NULL);
     source_mp3->metadata->icy = meta;
-    source_mp3->interval = -1;
 
-    mpeg_cleanup (client->format_data);
+    icy_client_in *in_icy = client->format_data;
+    if (in_icy)
+    {
+        mpeg_cleanup (&in_icy->sync);
+        refbuf_release (in_icy->read_data);
+        in_icy->read_data = NULL;
+        in_icy->read_count = 0;
+        in_icy->offset = 0;
+        in_icy->build_metadata_len = 0;
+    }
+    else
+        in_icy = client->format_data = calloc (1, sizeof (icy_client_in));
+    client->free_client_data = free_icysource_client_data;
 
+    if (plugin->type == FORMAT_TYPE_AAC || plugin->type == FORMAT_TYPE_MPEG)
+    {
+        mpeg_setup (&in_icy->sync, client->connection.ip);
+        plugin->write_buf_to_client = write_mpeg_buf_to_client;
+    }
+
+    source_mp3->icy_interval = ICY_METADATA_INTERVAL;       // default for listeners
+    in_icy->interval = -1;
     metadata = httpp_getvar (plugin->parser, "icy-metaint");
     if (metadata)
     {
-        client->flags |= CLIENT_META_INSTREAM;
-        source_mp3->inline_metadata_interval = atoi (metadata);
-        if (source_mp3->inline_metadata_interval > 0)
+        in_icy->interval = atoi (metadata);
+        if (in_icy->interval > 0)
         {
-            source_mp3->offset = 0;
             plugin->get_buffer = mp3_get_filter_meta;
-            if (source_mp3->inline_metadata_interval > 7999 && source_mp3->inline_metadata_interval < 32001)
-                source_mp3->interval = source_mp3->inline_metadata_interval;
-            else
-                source_mp3->interval = ICY_METADATA_INTERVAL;
-            INFO2 ("icy metadata format expected on %s, interval %d", plugin->mount, source_mp3->interval);
+            if (in_icy->interval > 500 && in_icy->interval < 50000)
+                source_mp3->icy_interval = in_icy->interval;
+            INFO2 ("icy metadata format expected on %s, interval %d", plugin->mount, in_icy->interval);
         }
+        else
+            WARN2 ("incoming metadata interval reported as %d on %s", in_icy->interval, plugin->mount);
     }
-    if (plugin->type == FORMAT_TYPE_AAC || plugin->type == FORMAT_TYPE_MPEG)
-    {
-        if (client->format_data == NULL)
-            client->format_data = malloc (sizeof (mpeg_sync));
-        mpeg_setup (client->format_data, client->connection.ip);
-        plugin->write_buf_to_client = write_mpeg_buf_to_client;
-    }
-    if (source_mp3->read_data == NULL)
-    {
-        source_mp3->read_data = refbuf_new (8000);
-        source_mp3->read_count = 0;
-    }
+    in_icy->read_data = refbuf_new (8000);
 }
 
 
@@ -280,11 +291,10 @@ static void mp3_set_tag (format_plugin_t *plugin, const char *tag, const char *i
 }
 
 
-static int parse_icy_metadata (const char *name, mp3_state *source_mp3)
+static int parse_icy_metadata (const char *name, mp3_state *source_mp3, const char *metadata, int meta_len)
 {
-    int meta_len = source_mp3->build_metadata_len, extra_len = 0;
+    int extra_len = 0;
     char *extra = NULL;
-    char *metadata = source_mp3->build_metadata;
 
     if (meta_len <= 1 || source_mp3->metadata == NULL)
         return 0;       // nothing to compare
@@ -366,7 +376,6 @@ static void format_mp3_apply_settings (format_plugin_t *format, mount_proxy *mou
 
     if (source_mp3 == NULL)
         return;
-    source_mp3->interval = -1;
     free (format->charset);
     format->charset = NULL;
 
@@ -378,27 +387,18 @@ static void format_mp3_apply_settings (format_plugin_t *format, mount_proxy *mou
         if (mount->max_send_size)
             source_mp3->max_send_size = mount->max_send_size;
         if (mount->mp3_meta_interval >= 0)
-            source_mp3->interval = mount->mp3_meta_interval;
+            source_mp3->icy_interval = mount->mp3_meta_interval;
         if (mount->charset)
             format->charset = strdup (mount->charset);
         if (mount->allow_chunked)
            format->flags |= FORMAT_FL_ALLOW_HTTPCHUNKED;
     }
-    if (source_mp3->interval < 0)
-    {
-        const char *metadata = httpp_getvar (format->parser, "icy-metaint");
-        source_mp3->interval = ICY_METADATA_INTERVAL;
-        if (metadata)
-        {
-            int interval = atoi (metadata);
-            if (interval > 7999 && interval < 32000)
-                source_mp3->interval = interval;
-        }
-    }
+    if (source_mp3->icy_interval < 0)
+        source_mp3->icy_interval = ICY_METADATA_INTERVAL;
     if (format->charset == NULL)
         format->charset = strdup (ICY_DEFAULT_CHARSET);
 
-    DEBUG1 ("sending metadata interval %d", source_mp3->interval);
+    DEBUG1 ("sending metadata interval %d", source_mp3->icy_interval);
     DEBUG1 ("charset %s", format->charset);
 }
 
@@ -406,7 +406,7 @@ static void format_mp3_apply_settings (format_plugin_t *format, mount_proxy *mou
 /* called from the source thread when the metadata has been updated.
  * The artist title are checked and made ready for clients to send
  */
-static void mp3_set_title (source_t *source)
+static void metadata_setup (source_t *source)
 {
     const char streamtitle[] = "StreamTitle='";
     const char streamurl[] = "StreamUrl='";
@@ -418,9 +418,10 @@ static void mp3_set_title (source_t *source)
 
     if (source_mp3->metadata && (source_mp3->metadata->on_queue) == 0 && source->queue_size)
     {
-         WARN1 ("ignoring this update to metadata on %s, as previous update has not had chance", source->mount);
+         INFO1 ("waiting for metadata to be pushed onto queue on %s before updating", source->mount);
          return;
     }
+
     /* work out message length */
     if (source_mp3->url_artist)
         len += strlen (source_mp3->url_artist);
@@ -434,15 +435,17 @@ static void mp3_set_title (source_t *source)
         len += strlen (source_mp3->url) + strlen (streamurl) + 2;
     if (source_mp3->extra_icy_meta)
         len += strlen (source_mp3->extra_icy_meta);
+    if (source_mp3->update_metadata == 1) // 1 lookup for conversion, 3 already converted
+        charset = source->format->charset;
+
+    source_mp3->update_metadata = 0;
+
 #define MAX_META_LEN 255*16
     if (len > MAX_META_LEN)
     {
         WARN1 ("Metadata too long at %d chars", len);
         return;
     }
-    if (source_mp3->update_metadata == 1) // 1 lookup for conversion, 3 already converted
-        charset = source->format->charset;
-
     /* work out the metadata len byte */
     len_byte = (len-1) / 16 + 1;
 
@@ -452,9 +455,10 @@ static void mp3_set_title (source_t *source)
     refbuf_t *icy = refbuf_new (size);
     if (icy)
     {
-        refbuf_t *flvmeta = flv_meta_allocate (4000);
+        refbuf_t *flvmeta = flv_meta_allocate (400);
         refbuf_t *iceblock = refbuf_new (4096);
-        mpeg_sync *mpeg_sync = source->client->format_data;
+        icy_client_in *icy_in = source->client->format_data;
+        mpeg_sync *mpeg_sync = &icy_in->sync;
         mp3_state *source_mp3 = source->format->_state;
         char *ibp = iceblock->data + 2;
         int r, n, ib_len = iceblock->len - 2;
@@ -468,18 +472,12 @@ static void mp3_set_title (source_t *source)
 
         if (mpeg_sync)
         {
-            char *str = stats_retrieve (source->stats, "server_name");
-            if (str) 
-            {
+            const char *str = stats_retrieve_nocopy (source->stats, "server_name");
+            if (str)
                 flv_meta_append_string (flvmeta, "name", str);
-                free (str);
-            }
-            str = stats_retrieve (source->stats, "server_description");
-            if (str) 
-            {
+            str = stats_retrieve_nocopy (source->stats, "server_description");
+            if (str)
                 flv_meta_append_string (flvmeta, "description", str);
-                free (str);
-            }
             flv_meta_append_number (flvmeta, "audiodatarate", syncframe_bitrate (mpeg_sync));
             flv_meta_append_number (flvmeta, "audiosamplerate", syncframe_samplerate (mpeg_sync));
             flv_meta_append_bool (flvmeta, "stereo", syncframe_channels (mpeg_sync) == 2 ? 1 : 0);
@@ -538,10 +536,10 @@ static void mp3_set_title (source_t *source)
                 r += snprintf (icy->data+r, size-r, "%s", source_mp3->extra_icy_meta);
             }
         }
-        DEBUG1 ("icy metadata as %.80s...", icy->data+1);
+        INFO3 ("icy metadata on %s as (%d) %.80s...", source->mount, icy->data[0], icy->data+1);
         yp_touch (source->mount, source->stats);
 
-        flv_meta_append_string (flvmeta, NULL, NULL);
+        flv_meta_append_end_marker (flvmeta);
 
         if (ib_len > 0) ib_len--; // add nul char to help parsing
         iceblock->len -= ib_len;
@@ -640,7 +638,7 @@ static int send_icy_metadata (client_t *client, refbuf_t *refbuf)
 /* Handler for writing mp3 data to a client, taking into account whether
  * client has requested shoutcast style metadata updates
  */
-static int format_mp3_write_buf_to_client (client_t *client) 
+static int format_mp3_write_buf_to_client (client_t *client)
 {
     int ret = -1, len;
     mp3_client_data *client_mp3 = client->format_data;
@@ -706,7 +704,7 @@ static int format_mp3_write_buf_to_client (client_t *client)
 }
 
 
-static int send_iceblock_to_client (client_t *client) 
+static int send_iceblock_to_client (client_t *client)
 {
     int ret = -1, len = 0, skip = 0;
     mp3_client_data *client_mpg = client->format_data;
@@ -757,7 +755,7 @@ static int send_iceblock_to_client (client_t *client)
 }
 
 
-static int write_mpeg_buf_to_client (client_t *client) 
+static int write_mpeg_buf_to_client (client_t *client)
 {
     if (client->flags & CLIENT_WANTS_META)
         return send_iceblock_to_client (client);
@@ -769,31 +767,24 @@ static int write_mpeg_buf_to_client (client_t *client)
 }
 
 
-static void format_mp3_free_plugin (format_plugin_t *plugin, client_t *client)
+static void format_mp3_free_plugin (format_plugin_t *plugin, client_t *c)
 {
     /* free the plugin instance */
-    mp3_state *format_mp3 = plugin->_state;
+    mp3_state *source_mp3 = plugin->_state;
 
-    if (client)
-    {
-        mpeg_cleanup (client->format_data);
-        free (client->format_data);
-        client->format_data = NULL;
-    }
-    free (format_mp3->url_artist);
-    free (format_mp3->url_title);
-    free (format_mp3->inline_url);
-    free (format_mp3->url);
-    free (format_mp3->extra_icy_meta);
-    metadata_blk_release (format_mp3->metadata);
-    refbuf_release (format_mp3->read_data);
-    free (format_mp3);
+    free (source_mp3->url_artist);
+    free (source_mp3->url_title);
+    free (source_mp3->inline_url);
+    free (source_mp3->url);
+    free (source_mp3->extra_icy_meta);
+    metadata_blk_release (source_mp3->metadata);
+    free (source_mp3);
 }
 
 
 /* This does the actual reading, making sure the read data is packaged in
  * blocks of 1400 bytes (near the common MTU size). This is because many
- * incoming streams come in small packets which could waste a lot of 
+ * incoming streams come in small packets which could waste a lot of
  * bandwidth with many listeners due to headers and such like.
  */
 static int complete_read (source_t *source)
@@ -801,35 +792,34 @@ static int complete_read (source_t *source)
     format_plugin_t *format = source->format;
     mp3_state *source_mp3 = format->_state;
     client_t *client = source->client;
+    icy_client_in *in_icy = client->format_data;
 
-    if (source_mp3->read_data == NULL)
+    if (in_icy->read_data == NULL)
     {
         size_up_qblock (source);
-        source_mp3->read_data = refbuf_new (source_mp3->qblock_sz);
-        source_mp3->read_count = 0;
+        in_icy->read_data = refbuf_new (source_mp3->qblock_sz);
+        in_icy->read_count = 0;
     }
-    if (format->read_bytes > 20000 && source_mp3->update_metadata) // only update after 20k received
+    if (source_mp3->update_metadata && format->read_bytes > 20000) // only update after 20k received
+        metadata_setup (source);
+
+    if (in_icy->read_count < in_icy->read_data->len)
     {
-        mp3_set_title (source);
-        source_mp3->update_metadata = 0;
-    }
-    if (source_mp3->read_count < source_mp3->read_data->len)
-    {
-        char *buf = source_mp3->read_data->data + source_mp3->read_count;
-        int read_in = source_mp3->read_data->len - source_mp3->read_count;
+        char *buf = in_icy->read_data->data + in_icy->read_count;
+        int read_in = in_icy->read_data->len - in_icy->read_count;
         int bytes = client_read_bytes (client, buf, read_in);
 
         if (bytes > 0)
         {
             rate_add (source->in_bitrate, bytes, client->worker->current_time.tv_sec);
-            source_mp3->read_count += bytes;
+            in_icy->read_count += bytes;
             format->read_bytes += bytes;
             // increase retry delay on small read, to reduce rescheduling
             if (read_in - bytes > 700)
                 client->schedule_ms += 10;
         }
     }
-    if (source_mp3->read_count < source_mp3->read_data->len)
+    if (in_icy->read_count < in_icy->read_data->len)
         return 0;
     if (source->incoming_rate && source->incoming_rate < 65536)
         client->schedule_ms += (65536/source->incoming_rate);
@@ -874,7 +864,8 @@ static int validate_mpeg (source_t *source, refbuf_t *refbuf)
 {
     client_t *client = source->client;
     mp3_state *source_mp3 = source->format->_state;
-    mpeg_sync *mpeg_sync = client->format_data;
+    icy_client_in *in_icy = client->format_data;
+    mpeg_sync *mpeg_sync = &in_icy->sync;
 
     int unprocessed = mpeg_complete_frames (mpeg_sync, refbuf, 0);
 
@@ -914,18 +905,18 @@ static int validate_mpeg (source_t *source, refbuf_t *refbuf)
 
         if (mpeg_block_expanded (mpeg_sync))
         {
-            source_mp3->read_data = refbuf_new (0);
-            source_mp3->read_data->data = refbuf->data;
-            source_mp3->read_data->len = refbuf->len;
-            source_mp3->read_count = unprocessed;
+            in_icy->read_data = refbuf_new (0);
+            in_icy->read_data->data = refbuf->data;
+            in_icy->read_data->len = refbuf->len;
+            in_icy->read_count = unprocessed;
             refbuf->data = NULL;
             client->pos = unprocessed;
             return -1;
         }
 
-        if (source_mp3->inline_metadata_interval > 0)
+        if (in_icy->interval > 0)
         {
-            if (source_mp3->inline_metadata_interval <= source_mp3->offset)
+            if (in_icy->interval <= in_icy->offset)
             {
                 // reached meta but we have a frame fragment, so keep it for later
                 leftover = refbuf_new (unprocessed);
@@ -935,19 +926,20 @@ static int validate_mpeg (source_t *source, refbuf_t *refbuf)
                 return refbuf->len ? 0 : -1;
             }
             // not reached the metadata block so save and rewind for completing the read
-            source_mp3->offset -= unprocessed;
+            in_icy->offset -= unprocessed;
         }
         size_up_qblock (source);
         len = source_mp3->qblock_sz;
         if (len < unprocessed + 40) // avoid extreme block shrinkage
         {
-            WARN3 ("source %s, len %ld, unprocessed %d", source->mount, (long)len, unprocessed);
-            len = unprocessed + 1000;
+            if (mpeg_get_type(mpeg_sync) == FORMAT_TYPE_UNDEFINED)
+                WARN3 ("source %s, len %ld, unprocessed %d", source->mount, (long)len, unprocessed);
+            len = unprocessed + 2000;
         }
         leftover = refbuf_new (len);
         memcpy (leftover->data, refbuf->data + refbuf->len, unprocessed);
-        source_mp3->read_data = leftover;
-        source_mp3->read_count = unprocessed;
+        in_icy->read_data = leftover;
+        in_icy->read_count = unprocessed;
     }
 
     return refbuf->len ? 0 : -1;
@@ -960,14 +952,15 @@ static refbuf_t *mp3_get_no_meta (source_t *source)
     refbuf_t *refbuf;
     mp3_state *source_mp3 = source->format->_state;
     client_t *client = source->client;  // maybe move mp3_state into client instead of plugin?
+    icy_client_in *in_icy = client->format_data;
 
     if (complete_read (source) == 0)
         return NULL;
 
-    refbuf = source_mp3->read_data;
-    refbuf->len = source_mp3->read_count;
-    source_mp3->read_count = 0;
-    source_mp3->read_data = NULL;
+    refbuf = in_icy->read_data;
+    refbuf->len = in_icy->read_count;
+    in_icy->read_count = 0;
+    in_icy->read_data = NULL;
 
     if (client->format_data && validate_mpeg (source, refbuf) < 0)
     {
@@ -993,31 +986,32 @@ static refbuf_t *mp3_get_filter_meta (source_t *source)
     format_plugin_t *plugin = source->format;
     mp3_state *source_mp3 = plugin->_state;
     client_t *client = source->client;  // maybe move mp3_state into client instead of plugin?
+    icy_client_in *in_icy = client->format_data;
     unsigned char *src;
     unsigned int bytes, mp3_block, copy_meta = 1;
 
     if (complete_read (source) == 0)
         return NULL;
 
-    refbuf = source_mp3->read_data;
-    source_mp3->read_data = NULL;
+    refbuf = in_icy->read_data;
+    in_icy->read_data = NULL;
     src = (unsigned char *)refbuf->data;
 
     /* fill the buffer with the read data */
-    bytes = source_mp3->read_count;
+    bytes = in_icy->read_count;
     refbuf->len = 0;
 
     while (bytes > 0)
     {
         unsigned int metadata_remaining;
 
-        mp3_block = source_mp3->inline_metadata_interval - source_mp3->offset;
+        mp3_block = in_icy->interval - in_icy->offset;
 
         /* is there only enough to account for mp3 data */
         if (bytes <= mp3_block)
         {
             refbuf->len += bytes;
-            source_mp3->offset += bytes;
+            in_icy->offset += bytes;
             break;
         }
         /* we have enough data to get to the metadata
@@ -1027,35 +1021,35 @@ static refbuf_t *mp3_get_filter_meta (source_t *source)
             src += mp3_block;
             bytes -= mp3_block;
             refbuf->len += mp3_block;
-            source_mp3->offset += mp3_block;
+            in_icy->offset += mp3_block;
             continue;
         }
 
         /* process the inline metadata, len == 0 indicates not seen any yet */
-        if (source_mp3->build_metadata_len == 0)
+        if (in_icy->build_metadata_len == 0)
         {
             copy_meta = (*src) ? 1 : 0; // is there any length to the metadata
             if (copy_meta)
-                memset (source_mp3->build_metadata, 0, sizeof (source_mp3->build_metadata));
-            source_mp3->build_metadata_offset = 0;
-            source_mp3->build_metadata_len = 1 + (*src * 16);
+                memset (in_icy->build_metadata, 0, sizeof (in_icy->build_metadata));
+            in_icy->build_metadata_offset = 0;
+            in_icy->build_metadata_len = 1 + (*src * 16);
         }
 
-        metadata_remaining = source_mp3->build_metadata_len - source_mp3->build_metadata_offset;
+        metadata_remaining = in_icy->build_metadata_len - in_icy->build_metadata_offset;
         if (bytes < metadata_remaining)
         {
             // incomplete short meta block
             if (copy_meta)
-                memcpy (source_mp3->build_metadata + source_mp3->build_metadata_offset, src, bytes);
-            source_mp3->build_metadata_offset += bytes;
+                memcpy (in_icy->build_metadata + in_icy->build_metadata_offset, src, bytes);
+            in_icy->build_metadata_offset += bytes;
             break;
         }
         if (copy_meta)
         {
             /* copy all bytes except the last one, that way we know a null byte terminates the message */
-            memcpy (source_mp3->build_metadata + source_mp3->build_metadata_offset, src, metadata_remaining-1);
+            memcpy (in_icy->build_metadata + in_icy->build_metadata_offset, src, metadata_remaining-1);
 
-            if (source_mp3->build_metadata_len > 1 && parse_icy_metadata (source->mount, source_mp3) < 0)
+            if (parse_icy_metadata (source->mount, source_mp3, in_icy->build_metadata, in_icy->build_metadata_len) < 0)
             {
                 WARN1 ("Unable to parse metadata insert for %s", source->mount);
                 source->flags &= ~SOURCE_RUNNING;
@@ -1063,8 +1057,8 @@ static refbuf_t *mp3_get_filter_meta (source_t *source)
                 return NULL;
             }
         }
-        source_mp3->offset = 0;
-        source_mp3->build_metadata_len = 0;
+        in_icy->offset = 0;
+        in_icy->build_metadata_len = 0;
         bytes -= metadata_remaining;
         memmove (src, src+metadata_remaining, bytes); /* overwrite meta block */
     }
@@ -1089,19 +1083,15 @@ static refbuf_t *mp3_get_filter_meta (source_t *source)
 }
 
 
-static int format_mp3_create_client_data (format_plugin_t *plugin, client_t *client)
+static int format_mp3_create_client_data (format_plugin_t *plugin, ice_http_t *http, client_t *client)
 {
     mp3_client_data *client_mp3;
     mp3_state *source_mp3 = plugin->_state;
     const char *metadata;
-    size_t  remaining;
-    char *ptr;
-    int bytes;
 
     if (client->flags & CLIENT_WANTS_FLV)
     {
-        flv_create_client_data (plugin, client); // special case
-        return 0;
+        return flv_create_client_data (plugin, http, client); // special case
     }
     client->free_client_data = free_mp3_client_data;
     client_mp3 = calloc(1,sizeof(mp3_client_data));
@@ -1122,58 +1112,34 @@ static int format_mp3_create_client_data (format_plugin_t *plugin, client_t *cli
     else
         client_mp3->max_send_size = 24000; // largest single write, block very unlikely to be larger
 
-    if (client->refbuf == NULL)
-        client->refbuf = refbuf_new (4096);
-    client->refbuf->len = 0;
-
     metadata = httpp_getvar(client->parser, "icy-metadata");
     if (metadata && atoi(metadata))
+    {
+        httpp_deletevar (client->parser, HTTPP_VAR_VERSION);
         httpp_setvar (client->parser, HTTPP_VAR_VERSION, "1.0"); // hack force 1.0 if icy metadata requested
+    }
 
-    if (format_general_headers (plugin, client) < 0)
+    if (format_client_headers (plugin, http, client) < 0)
         return -1;
 
     if ((client->flags & CLIENT_AUTHENTICATED) == 0)
         return 0;
 
-    client->refbuf->len -= 2;
-    remaining = 4096 - client->refbuf->len;
-    ptr = client->refbuf->data + client->refbuf->len;
-
     if (httpp_getvar (client->parser, "iceblocks"))
     {
         client->flags |= CLIENT_WANTS_META;
-        bytes = snprintf (ptr, remaining, "IceBlocks: 1.1\r\n");
-        remaining -= bytes;
-        ptr += bytes;
+        ice_http_printf (http, "IceBlocks", 0, "1.1");
     }
     else
     {
         /* check for shoutcast style metadata inserts */
         if (metadata && atoi(metadata))
         {
-            if (source_mp3->interval >= 0)
-                client_mp3->interval = source_mp3->interval;
-            else
-                client_mp3->interval = ICY_METADATA_INTERVAL;
+            client_mp3->interval = source_mp3->icy_interval;
             if (client_mp3->interval)
-            {
-                bytes = snprintf (ptr, remaining, "icy-metaint:%u\r\n",
-                        client_mp3->interval);
-                if (bytes > 0)
-                {
-                    remaining -= bytes;
-                    ptr += bytes;
-                }
-            }
+                ice_http_printf (http, "icy-metaint", 0, "%u", client_mp3->interval);
         }
     }
-    bytes = snprintf (ptr, remaining, "\r\n");
-    remaining -= bytes;
-    ptr += bytes;
-
-    client->refbuf->len = 4096 - remaining;
-
     return 0;
 }
 

@@ -3,7 +3,8 @@
  * This program is distributed under the GNU General Public License, version 2.
  * A copy of this license is included with this source.
  *
- * Copyright 2000-2004, Jack Moffitt <jack@xiph.org, 
+ * Copyright 2010-2022, Karl Heyes <karl@kheyes.plus.com>,
+ * Copyright 2000-2004, Jack Moffitt <jack@xiph.org>,
  *                      Michael Smith <msmith@xiph.org>,
  *                      oddsock <oddsock@xiph.org>,
  *                      Karl Heyes <karl@xiph.org>
@@ -97,7 +98,7 @@ static struct admin_command admin_general[] =
     { "listmounts.xsl",     XSLT,   { command_list_mounts } },
     { "moveclients.xsl",    XSLT,   { command_list_mounts } },
     { "function.xsl",       XSLT,   { command_admin_function } },
-    { "response.xsl",       XSLT },
+    { "response.xsl",       XSLT,   { NULL } },
     { NULL }
 };
 
@@ -174,12 +175,10 @@ xmlDocPtr admin_build_sourcelist (const char *mount, int show_listeners)
             {
                 if (mountinfo->auth)
                 {
-                    xmlNewChild (srcnode, NULL, XMLSTR("authenticator"), 
-                            XMLSTR(mountinfo->auth->type));
+                    xmlNewChild (srcnode, NULL, XMLSTR("authenticator"), XMLSTR(mountinfo->auth->type));
                 }
-                if (mountinfo->fallback_mount)
-                    xmlNewChild (srcnode, NULL, XMLSTR("fallback"), 
-                            XMLSTR(mountinfo->fallback_mount));
+                if (mountinfo->fallback.mount)
+                    xmlNewChild (srcnode, NULL, XMLSTR("fallback"), XMLSTR(mountinfo->fallback.mount));
             }
             config_release_config();
 
@@ -191,8 +190,7 @@ xmlDocPtr admin_build_sourcelist (const char *mount, int show_listeners)
                             (unsigned long)(now - source->client->connection.con_time));
                     xmlNewChild (srcnode, NULL, XMLSTR("Connected"), XMLSTR(buf));
                 }
-                xmlNewChild (srcnode, NULL, XMLSTR("content-type"), 
-                        XMLSTR(source->format->contenttype));
+                xmlNewChild (srcnode, NULL, XMLSTR("content-type"), XMLSTR(source->format->contenttype));
                 if (show_listeners)
                     admin_source_listeners (source, srcnode);
             }
@@ -204,30 +202,28 @@ xmlDocPtr admin_build_sourcelist (const char *mount, int show_listeners)
 }
 
 
-int admin_send_response (xmlDocPtr doc, client_t *client, 
+int admin_send_response (xmlDocPtr doc, client_t *client,
         admin_response_type response, const char *xslt_template)
 {
     int ret = -1;
 
+    client->flags |= CLIENT_KEEPALIVE; // allow these for keepalives
     if (response == RAW)
     {
         xmlChar *buff = NULL;
         int len = 0;
-        unsigned int buf_len;
-        const char *http = "HTTP/1.0 200 OK\r\n"
-               "Content-Type: text/xml\r\n"
-               "Content-Length: ";
         xmlDocDumpFormatMemoryEnc (doc, &buff, &len, NULL, 1);
-        buf_len = strlen (http) + len + 50;
-        client_set_queue (client, NULL);
-        client->refbuf = refbuf_new (buf_len);
-        len = snprintf (client->refbuf->data, buf_len, "%s%d\r\n%s\r\n\r\n%s", http, len,
-                client_keepalive_header (client), buff);
-        client->refbuf->len = len;
+        refbuf_t *rb = refbuf_new (len);
+        memcpy (rb->data, buff, len);
         xmlFree(buff);
         xmlFreeDoc (doc);
-        client->respcode = 200;
-        return fserve_setup_client (client);
+
+        ice_http_t http = ICE_HTTP_INIT;
+        ice_http_setup_flags (&http, client, 200, 0, NULL);
+        http.in_length = len;
+        ice_http_printf (&http, "Content-Type", 0, "%s", "text/xml");
+        ice_http_apply_block (&http, rb);
+        return client_http_send (&http);
     }
     if (response == XSLT)
     {
@@ -235,7 +231,7 @@ int admin_send_response (xmlDocPtr doc, client_t *client,
         int fullpath_xslt_template_len;
         ice_config_t *config = config_get_config();
 
-        fullpath_xslt_template_len = strlen (config->adminroot_dir) + 
+        fullpath_xslt_template_len = strlen (config->adminroot_dir) +
             strlen(xslt_template) + 2;
         fullpath_xslt_template = malloc(fullpath_xslt_template_len);
         snprintf(fullpath_xslt_template, fullpath_xslt_template_len, "%s%s%s",
@@ -243,7 +239,7 @@ int admin_send_response (xmlDocPtr doc, client_t *client,
         config_release_config();
 
         DEBUG1("Sending XSLT (%s)", fullpath_xslt_template);
-        ret = xslt_transform (doc, fullpath_xslt_template, client);
+        ret = xslt_transform_admin (doc, fullpath_xslt_template, client);
         free(fullpath_xslt_template);
     }
     return ret;
@@ -285,10 +281,18 @@ int admin_mount_request (client_t *client)
 {
     source_t *source;
     const char *mount = client->mount;
-    char *uri = (void*)client->aux_data;
 
+    client->ops = &admin_mount_ops;
+    if (client_add_incoming (client))   // if add to worker, run from there
+        return 0;
+    if ((client->flags & CLIENT_AUTHENTICATED) == 0)
+    {
+        WARN1 ("Failed auth for source \"%s\"", client->mount);
+        return client_send_401 (client, NULL);
+    }
+
+    const char *uri = httpp_getvar (client->parser, "__admin_cmd");
     struct admin_command *cmd = find_admin_command (admin_mount, uri);
-
     if (cmd == NULL)
         return command_stats (client, uri);
 
@@ -297,23 +301,13 @@ int admin_mount_request (client_t *client)
         INFO0("mount request not recognised");
         return client_send_400 (client, "unknown request");
     }
-
-    if ((client->flags & CLIENT_ACTIVE) == 0)   // non-worker to kick it back to worker.
-    {
-        worker_t *worker = client->worker;
-        DEBUG0 ("client passed auth, but on different thread to src, reschedule on worker");
-        client->mount = httpp_get_query_param (client->parser, "mount");
-        client->flags |= CLIENT_ACTIVE;
-        worker_wakeup (worker);
-        return 0;
-    }
-
     avl_tree_rlock(global.source_tree);
     source = source_find_mount_raw(mount);
 
     if (source == NULL)
     {
         avl_tree_unlock(global.source_tree);
+        client->mount = NULL;
         if (strncmp (cmd->request, "stats", 5) == 0)
             return command_stats (client, uri);
         if (strncmp (cmd->request, "listclients", 11) == 0)
@@ -321,37 +315,31 @@ int admin_mount_request (client_t *client)
         if (strncmp (cmd->request, "killclient", 10) == 0)
             return fserve_kill_client (client, mount, cmd->response);
         WARN1("Admin command on non-existent source %s", mount);
-        free (uri);
         return client_send_400 (client, "Source does not exist");
     }
     else
     {
-        int ret = 0;
+        thread_rwlock_wlock (&source->lock);
+        avl_tree_unlock (global.source_tree);
 
         // see if we should move workers. avoid excessive write lock bubbles in worker run queue
         worker_t *src_worker = source->client->worker;
         if (src_worker != client->worker)
         {
-            client->ops = &admin_mount_ops;
-            avl_tree_unlock (global.source_tree);
+            thread_rwlock_rlock (&workers_lock);
+            thread_rwlock_unlock (&source->lock);
             // DEBUG0 (" moving admin request to alternate worker");
-            return client_change_worker (client, src_worker);
+            int ret = client_change_worker (client, src_worker);
+            thread_rwlock_unlock (&workers_lock);
+            return ret;
         }
-        thread_rwlock_wlock (&source->lock);
         if (source_available (source) == 0)
         {
             thread_rwlock_unlock (&source->lock);
-            avl_tree_unlock (global.source_tree);
-            if (strncmp (cmd->request, "stats", 5) == 0)
-                return command_stats (client, uri);
             INFO1("Received admin command on unavailable mount \"%s\"", mount);
-            free (uri);
             return client_send_400 (client, "Source is not available");
         }
-        avl_tree_unlock(global.source_tree);
-        free (uri);
-        ret = cmd->handle.source (client, source, cmd->response);
-        return ret;
+        return cmd->handle.source (client, source, cmd->response);
     }
 }
 
@@ -416,7 +404,8 @@ int admin_handle_request (client_t *client, const char *uri)
     {
         xmlSetStructuredErrorFunc ((char*)mount, config_xml_parse_failure);
         client->mount = mount;
-        client->aux_data = (int64_t)strdup (uri);
+        // install a command copy in parser in case delayed auth needs it. It may of been aliased
+        httpp_setvar (client->parser, "__admin_cmd", uri);
 
         /* no auth/stream required for this */
         if (strcmp (uri, "buildm3u") == 0)
@@ -430,14 +419,14 @@ int admin_handle_request (client_t *client, const char *uri)
             switch (auth_check_source (client, mount))
             {
                 case 0:
+                    client->flags |= CLIENT_AUTHENTICATED;
                     break;
                 default:
                     INFO1("Bad or missing password on mount modification "
                             "admin request (%s)", uri);
                     return client_send_401 (client, NULL);
-                    /* fall through */
                 case 1:
-                    return 0;
+                    return 1;
             }
         }
         if (strcmp (uri, "streams") == 0)
@@ -479,48 +468,56 @@ static int command_require (client_t *client, const char *name, const char **var
     if (*var == NULL)
         return -1;
     return 0;
-} 
+}
 
 #define COMMAND_OPTIONAL(client,name,var) \
     (var) = httpp_get_query_param((client)->parser, (name))
 
 int html_success (client_t *client, const char *message)
 {
-    client->respcode = 200;
-    snprintf (client->refbuf->data, PER_CLIENT_REFBUF_SIZE,
-            "HTTP/1.0 200 OK\r\nContent-Type: text/html\r\n\r\n" 
+    ice_http_t http = ICE_HTTP_INIT;
+    if (ice_http_setup_flags (&http, client, 200, 0, NULL) < 0) return -1;
+    ice_http_printf (&http, NULL, 0,
             "<html><head><title>Admin request successful</title></head>"
             "<body><p>%s</p></body></html>", message);
-    client->refbuf->len = strlen (client->refbuf->data);
-    return fserve_setup_client (client);
+    return client_http_send (&http);
 }
 
 
 static int command_move_clients (client_t *client, source_t *source, int response)
 {
-    const char *dest_source;
+    const char *dest_source, *rate_str = "";
     xmlDocPtr doc;
     xmlNodePtr node;
     int parameters_passed = 0;
+    uint64_t rate = 0;
     char buf[255];
 
     if((COMMAND_OPTIONAL(client, "destination", dest_source))) {
         parameters_passed = 1;
     }
+    if ((COMMAND_OPTIONAL(client, "rate", rate_str)))
+        if (rate_str == NULL || sscanf (rate_str, "%" SCNu64, &rate) != 1 || rate > 10000000)
+            parameters_passed = 0;
+
     if (!parameters_passed) {
         doc = admin_build_sourcelist(source->mount, 0);
         thread_rwlock_unlock (&source->lock);
         return admin_send_response(doc, client, response, "moveclients.xsl");
     }
-    INFO2 ("source is \"%s\", destination is \"%s\"", source->mount, dest_source);
+    INFO3 ("source is \"%s\", destination is \"%s\" (%" PRIu64 ")", source->mount, dest_source, rate);
 
     doc = xmlNewDoc(XMLSTR("1.0"));
     node = xmlNewDocNode(doc, NULL, XMLSTR("iceresponse"), NULL);
     xmlDocSetRootElement(doc, node);
 
-    source_set_fallback (source, dest_source);
-    source->termination_count = source->listeners;
-    source->flags |= SOURCE_LISTENERS_SYNC;
+    if (source->listeners)
+    {
+        fbinfo fb = { .mount = (char*)dest_source, .limit = rate };
+        source_set_fallback (source, &fb);
+        source->listener_check = source->listeners;
+        source->flags |= SOURCE_LISTENERS_SYNC;
+    }
 
     snprintf (buf, sizeof(buf), "Clients moved from %s to %s",
             source->mount, dest_source);
@@ -545,10 +542,6 @@ static int admin_function (const char *function, char *buf, unsigned int len)
     }
     if (strcmp (function, "updatecfg") == 0)
     {
-#ifdef HAVE_SIGNALFD
-        connection_running = 0;
-        connection_close_sigfd();
-#endif
         global . schedule_config_reread = 1;
         snprintf (buf, len, "Requesting reread of configuration file");
         return 0;
@@ -592,6 +585,8 @@ static void add_relay_xmlnode (xmlNodePtr node, relay_server *relay)
     xmlNewChild (relaynode, NULL, XMLSTR("on_demand"), XMLSTR(str));
     snprintf (str, sizeof (str), "%d", (relay->flags & RELAY_FROM_MASTER ? 1 : 0));
     xmlNewChild (relaynode, NULL, XMLSTR("from_master"), XMLSTR(str));
+    snprintf (str, sizeof (str), "%d", relay->run_on);
+    xmlNewChild (relaynode, NULL, XMLSTR("run_on"), XMLSTR(str));
     while (host)
     {
         xmlNodePtr masternode = xmlNewChild (relaynode, NULL, XMLSTR("master"), NULL);
@@ -599,6 +594,10 @@ static void add_relay_xmlnode (xmlNodePtr node, relay_server *relay)
         xmlNewChild (masternode, NULL, XMLSTR("mount"), XMLSTR(host->mount));
         snprintf (str, sizeof (str), "%d", host->port);
         xmlNewChild (masternode, NULL, XMLSTR("port"), XMLSTR(str));
+        snprintf (str, sizeof (str), "%d", host->priority);
+        xmlNewChild (masternode, NULL, XMLSTR("priority"), XMLSTR(str));
+        if (host == relay->in_use)
+            xmlNewChild (masternode, NULL, XMLSTR("active"), XMLSTR("true"));
         host = host->next;
     }
 }
@@ -791,43 +790,16 @@ static int command_buildm3u (client_t *client, const char *mount)
 {
     const char *username = NULL;
     const char *password = NULL;
-    ice_config_t *config;
-    const char *host = httpp_getvar (client->parser, "host");
-    const char *protocol = not_ssl_connection (&client->connection) ? "http" : "https";
 
     if (COMMAND_REQUIRE(client, "username", username) < 0 ||
             COMMAND_REQUIRE(client, "password", password) < 0)
         return client_send_400 (client, "missing arg, username/password");
 
-    client->respcode = 200;
-    config = config_get_config();
-    if (host)
-    {
-        char port[10] = "";
-        if (strchr (host, ':') == NULL)
-            snprintf (port, sizeof (port), ":%u",  config->port);
-        snprintf (client->refbuf->data, PER_CLIENT_REFBUF_SIZE,
-                "HTTP/1.0 200 OK\r\n"
-                "Content-Type: audio/x-mpegurl\r\n"
-                "Content-Disposition: attachment; filename=\"listen.m3u\"\r\n\r\n"
-                "%s://%s:%s@%s%s%s\r\n",
-                protocol, username, password,
-                host, port, mount);
-    }
-    else
-    {
-        snprintf (client->refbuf->data, PER_CLIENT_REFBUF_SIZE,
-                "HTTP/1.0 200 OK\r\n"
-                "Content-Type: audio/x-mpegurl\r\n"
-                "Content-Disposition: attachment; filename=\"listen.m3u\"\r\n\r\n"
-                "%s://%s:%s@%s:%d%s\r\n",
-                protocol, username, password,
-                config->hostname, config->port, mount);
-    }
-    config_release_config();
-
-    client->refbuf->len = strlen (client->refbuf->data);
-    return fserve_setup_client (client);
+    free (client->username);
+    client->username = strdup (username);
+    free (client->password);
+    client->password = strdup (password);
+    return client_send_m3u (client, mount);
 }
 
 
@@ -952,7 +924,11 @@ static int command_kill_client (client_t *client, source_t *source, int response
         return client_send_400 (client, "missing arg, id");
     }
 
-    sscanf (idtext, "%" SCNu64, &id);
+    if (sscanf (idtext, "%" SCNu64, &id) != 1)
+    {
+        thread_rwlock_unlock (&source->lock);
+        return client_send_400 (client, "invalid value, id");
+    }
 
     listener = source_find_client(source, id);
 
@@ -999,8 +975,8 @@ static int command_fallback (client_t *client, source_t *source, int response)
         if (COMMAND_REQUIRE(client, "fallback", fallback) < 0)
             return client_send_400 (client, "missing arg, fallback");
 
-        xmlFree (mountinfo->fallback_mount);
-        mountinfo->fallback_mount = (char *)xmlCharStrdup (fallback);
+        xmlFree (mountinfo->fallback.mount);
+        mountinfo->fallback.mount = (char *)xmlCharStrdup (fallback);
         snprintf (buffer, sizeof (buffer), "Fallback for \"%s\" configured", mountinfo->mountname);
         config_release_config ();
         return html_success (client, buffer);
@@ -1048,10 +1024,12 @@ static int command_metadata (client_t *client, source_t *source, int response)
             stats_event (source->mount, "artwork", artwork);
         if (intro)
         {
-            source_set_intro (source, intro);
+            source_set_intro (source, NULL, intro);
         }
         if (plugin->set_tag)
         {
+            if (charset == NULL && plugin->charset)
+                charset = plugin->charset;  // optionally use format setting if request has not provided one
             if (url)
             {
                 plugin->set_tag (plugin, "url", url, charset);
@@ -1088,7 +1066,7 @@ static int command_metadata (client_t *client, source_t *source, int response)
     } while (0);
     INFO1 ("Metadata on mountpoint %s prevented", source->mount);
     thread_rwlock_unlock (&source->lock);
-    xmlNewChild(node, NULL, XMLSTR("message"), 
+    xmlNewChild(node, NULL, XMLSTR("message"),
             XMLSTR("Mountpoint will not accept this URL update"));
     xmlNewChild(node, NULL, XMLSTR("return"), XMLSTR("1"));
     return admin_send_response(doc, client, response, "response.xsl");
@@ -1129,6 +1107,7 @@ static int command_shoutcast_metadata (client_t *client, source_t *source)
         if (same_ip && source->format && source->format->set_tag)
         {
             httpp_set_query_param (client->parser, "mount", client->server_conn->shoutcast_mount);
+            client->mount = client->server_conn->shoutcast_mount;
             source->format->set_tag (source->format, "title", value, NULL);
             source->format->set_tag (source->format, NULL, NULL, NULL);
 
@@ -1191,22 +1170,29 @@ static int command_list_log (client_t *client, int response)
     if (logname == NULL)
         return client_send_400 (client, "No log specified");
 
+    const char *level_arg = httpp_get_query_param (client->parser, "level");
+    int level = level_arg ? atoi (level_arg) : -1;
+    if (level < 0 || level > 4)
+        level = -1;      // let log subsys to choose
+
     config = config_get_config ();
-    if (strcmp (logname, "errorlog") == 0)
+    if (strcmp (logname, "startup") == 0)
+        log = 0;
+    else if (strcmp (logname, "errorlog") == 0)
         log = config->error_log.logid;
     else if (strcmp (logname, "accesslog") == 0)
         log = config->access_log.logid;
     else if (strcmp (logname, "playlistlog") == 0)
         log = config->playlist_log.logid;
 
-    if (log_contents (log, NULL, &len) < 0)
+    if (log_contents (log, level, NULL, &len) < 0)
     {
         config_release_config();
         WARN1 ("request to show unknown log \"%s\"", logname);
-        return client_send_400 (client, "unknown");
+        return client_send_400 (client, "unknown log");
     }
     content = refbuf_new (len+1);
-    log_contents (log, &content->data, &content->len);
+    log_contents (log, level, &content->data, &content->len);
     config_release_config();
 
     if (response == XSLT)
@@ -1224,15 +1210,12 @@ static int command_list_log (client_t *client, int response)
     }
     else
     {
-        refbuf_t *http = refbuf_new (100);
-        int len = snprintf (http->data, 100, "%s",
-                "HTTP/1.0 200 OK\r\nContent-Type: text/plain\r\n\r\n");
-        http->len = len;
-        http->next = content; 
-        client->respcode = 200;
-        client_set_queue (client, NULL);
-        client->refbuf = http;
-        return fserve_setup_client (client);
+        ice_http_t http = ICE_HTTP_INIT;
+        if (ice_http_setup_flags (&http, client, 200, 0, NULL) < 0) return -1;
+        ice_http_apply_block (&http, content);
+        http.in_length = content->len;
+        ice_http_printf (&http, "Content-Type", 0, "text/plain");
+        return client_http_send (&http);
     }
 }
 
@@ -1242,21 +1225,20 @@ int command_list_mounts(client_t *client, int response)
     DEBUG0("List mounts request");
 
     client_set_queue (client, NULL);
-    client->refbuf = refbuf_new (PER_CLIENT_REFBUF_SIZE);
     if (response == TEXT)
     {
         redirector_update (client);
 
-        snprintf (client->refbuf->data, PER_CLIENT_REFBUF_SIZE,
-                "HTTP/1.0 200 OK\r\nContent-Type: text/html\r\n\r\n");
-        client->refbuf->len = strlen (client->refbuf->data);
-        client->respcode = 200;
-
+        refbuf_t *rb;
         if (strcmp (httpp_getvar (client->parser, HTTPP_VAR_URI), "/admin/streams") == 0)
-            client->refbuf->next = stats_get_streams (1);
+            rb = stats_get_streams (1);
         else
-            client->refbuf->next = stats_get_streams (0);
-        return fserve_setup_client (client);
+            rb = stats_get_streams (0);
+
+        ice_http_t http = ICE_HTTP_INIT;
+        if (ice_http_setup_flags (&http, client, 200, 0, NULL) < 0) return -1;
+        ice_http_apply_block (&http, rb);
+        return client_http_send (&http);
     }
     else
     {

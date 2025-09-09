@@ -3,8 +3,8 @@
 ACLOCAL_AMFLAGS = -I m4
 
 SUBDIRS = conf doc web admin src
-if WIN32
-SUBDIRS += win32
+if WINDOWS
+SUBDIRS += windows
 endif
 
 BUILT_SOURCES = git_hash.h
@@ -23,9 +23,18 @@ git_hash.h: FORCE
 	@$(SHELL_PATH) $(srcdir)/GIT-VERSION-GEN
 FORCE:
 
+# example build line
+# make CFLAGS="-O2 -s -pipe -Wall -Wp,-D_FORTIFY_SOURCE=2 -fexceptions --param=ssp-buffer-size=4 -ffile-prefix-map=$(pwd)=" CXXFLAGS='$(CFLAGS)' V=1
+# V=1 to show lines
+# file-prefix-map to filter out absolute path lines in binary
+#
 debug:
 	$(MAKE) all CFLAGS="-Wno-unused-parameter @DEBUG@"
 
+win64:
+	$(MAKE) all CFLAGS="-O2 -s" CXXFLAGS="-O2 -s"
+win32:
+	$(MAKE) all CFLAGS="-O2 -s" CXXFLAGS="-O2 -s"
 profile:
 	$(MAKE) all CFLAGS="@PROFILE@"
 

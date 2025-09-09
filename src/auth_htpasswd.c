@@ -3,14 +3,15 @@
  * This program is distributed under the GNU General Public License, version 2.
  * A copy of this license is included with this source.
  *
- * Copyright 2000-2004, Jack Moffitt <jack@xiph.org, 
+ * Copyright 2010-2022, Karl Heyes <karl@kheyes.plus.com>,
+ * Copyright 2000-2004, Jack Moffitt <jack@xiph.org>,
  *                      Michael Smith <msmith@xiph.org>,
  *                      oddsock <oddsock@xiph.org>,
  *                      Karl Heyes <karl@xiph.org>
  *                      and others (see AUTHORS for details).
  */
 
-/** 
+/**
  * Client authentication functions
  */
 
@@ -219,7 +220,7 @@ static auth_result htpasswd_auth (auth_client *auth_user)
         {
             free (hashed_pw);
             thread_rwlock_unlock (&htpasswd->file_rwlock);
-            client->flags |= CLIENT_AUTHENTICATED;
+            auth_user->flags |= CLIENT_AUTHENTICATED;
             return AUTH_OK;
         }
         thread_rwlock_unlock (&htpasswd->file_rwlock);

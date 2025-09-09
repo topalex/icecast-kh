@@ -3,15 +3,15 @@
  * This program is distributed under the GNU General Public License, version 2.
  * A copy of this license is included with this source.
  *
- * Copyright 2012-2020, Karl Heyes <karl@kheyes.plus.com>
- * Copyright 2000-2004, Jack Moffitt <jack@xiph.org, 
+ * Copyright 2012-2022, Karl Heyes <karl@kheyes.plus.com>
+ * Copyright 2000-2004, Jack Moffitt <jack@xiph.org>,
  *                      Michael Smith <msmith@xiph.org>,
  *                      oddsock <oddsock@xiph.org>,
  *                      Karl Heyes <karl@xiph.org>
  *                      and others (see AUTHORS for details).
  */
 
-/** 
+/**
  * Client authentication via command functions
  *
  * The stated program is started and via it's stdin it is passed
@@ -91,7 +91,7 @@ static void process_header (const char *p, auth_client *auth_user)
         return;
     }
     if (strncasecmp (p, "icecast-slave:", 14) == 0)
-        client->flags |= CLIENT_IS_SLAVE;
+        auth_user->flags |= CLIENT_IS_SLAVE;
     if (strncasecmp (p, "Location: ", 10) == 0)
     {
         int len = strcspn ((char*)p+10, "\r\n");
@@ -114,9 +114,9 @@ static void process_header (const char *p, auth_client *auth_user)
     if (strncasecmp (p, "icecast-auth-user: ", 19) == 0)
     {
         if (strcmp (p+19, "withintro") == 0)
-            client->flags |= CLIENT_AUTHENTICATED|CLIENT_HAS_INTRO_CONTENT;
+            auth_user->flags |= CLIENT_AUTHENTICATED|CLIENT_HAS_INTRO_CONTENT;
         else if (strcmp (p+19, "1") == 0)
-            client->flags |= CLIENT_AUTHENTICATED;
+            auth_user->flags |= CLIENT_AUTHENTICATED;
         return;
     }
     if (strncasecmp (p, "icecast-auth-timelimit: ", 24) == 0)
@@ -141,7 +141,7 @@ static void process_body (int fd, pid_t pid, auth_client *auth_user)
 {
     client_t *client = auth_user->client;
 
-    if (client->flags & CLIENT_HAS_INTRO_CONTENT)
+    if (auth_user->flags & CLIENT_HAS_INTRO_CONTENT)
     {
         refbuf_t *head = client->refbuf, *r = head->next;
         client_t *client = auth_user->client;
@@ -189,19 +189,19 @@ static void process_body (int fd, pid_t pid, auth_client *auth_user)
         else
             refbuf_release (r);
         if (client->refbuf->next == NULL)
-            client->flags &= ~CLIENT_HAS_INTRO_CONTENT;
+            auth_user->flags &= ~CLIENT_HAS_INTRO_CONTENT;
     }
 }
 
 static void get_response (int fd, auth_client *auth_user, pid_t pid)
 {
     client_t *client = auth_user->client;
-    refbuf_t *r = client->refbuf;
-    char *buf = r->data, *blankline;
-    unsigned remaining = 4095; /* leave a nul char at least */
     int ret = 0;
+    refbuf_t *r = client->refbuf = refbuf_new (4096);
+    unsigned remaining = r->len - 1;  /* leave a nul char at least */
+    char *buf = r->data, *blankline;
 
-    memset (r->data, 0, remaining+1);
+    memset (r->data, 0, r->len);
     sock_set_blocking (fd, 0);
     while (remaining)
     {
@@ -248,7 +248,7 @@ static void get_response (int fd, auth_client *auth_user, pid_t pid)
                 process_header (p, auth_user);
                 p = nl+1;
             } while (*p != '\n');
-            if (client->flags & CLIENT_HAS_INTRO_CONTENT)
+            if (auth_user->flags & CLIENT_HAS_INTRO_CONTENT)
             {
                 r->len = buf - (blankline + 2);
                 if (r->len)
@@ -359,7 +359,7 @@ static auth_result auth_cmd_client (auth_client *auth_user)
                 return AUTH_FAILED;
             }
 
-            if (client->flags & CLIENT_AUTHENTICATED)
+            if (auth_user->flags & CLIENT_AUTHENTICATED)
                 return AUTH_OK;
             break;
     }

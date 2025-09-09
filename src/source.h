@@ -3,7 +3,8 @@
  * This program is distributed under the GNU General Public License, version 2.
  * A copy of this license is included with this source.
  *
- * Copyright 2000-2004, Jack Moffitt <jack@xiph.org, 
+ * Copyright 2010-2023, Karl Heyes <karl@kheyes.plus.com>
+ * Copyright 2000-2004, Jack Moffitt <jack@xiph.org>,
  *                      Michael Smith <msmith@xiph.org>,
  *                      oddsock <oddsock@xiph.org>,
  *                      Karl Heyes <karl@xiph.org>
@@ -18,6 +19,7 @@
 #include "util.h"
 #include "format.h"
 #include "fserve.h"
+#include "stats.h"
 
 #include <stdio.h>
 
@@ -26,7 +28,6 @@ typedef struct source_tag
     char *mount;
     unsigned int flags;
     int listener_send_trigger;
-    char wakeup;
 
     rwlock_t lock;
 
@@ -52,8 +53,10 @@ typedef struct source_tag
     int incoming_adj;
     long limit_rate;
     time_t wait_time;
+    time_t linger_time;
+    int linger_duration;
 
-    long termination_count;
+    long listener_check;
     unsigned long peak_listeners;
     unsigned long listeners;
     unsigned long prev_listeners;
@@ -76,7 +79,7 @@ typedef struct source_tag
     unsigned int queue_size;
     unsigned int queue_size_limit;
 
-    spin_t shrink_lock;
+    mutex_t shrink_lock;
     uint64_t shrink_pos;
     uint64_t shrink_time;
 
@@ -87,7 +90,7 @@ typedef struct source_tag
 
     int intro_skip_replay;
     int stats_interval;
-    long stats;
+    stats_handle_t stats;
 
     time_t last_read;
 
@@ -107,16 +110,18 @@ typedef struct source_tag
 #define SOURCE_LISTENERS_SYNC       (1<<5)
 #define SOURCE_TIMEOUT              (1<<6)
 #define SOURCE_RESERVED             (1<<7)
+#define SOURCE_SWITCHOVER           (1<<8)
 
 #define source_available(x)     (((x)->flags & (SOURCE_RUNNING|SOURCE_ON_DEMAND)) && ((x)->flags & SOURCE_LISTENERS_SYNC) == 0)
 #define source_running(x)       (((x)->flags & (SOURCE_TERMINATING|SOURCE_RUNNING)) == SOURCE_RUNNING)
 
-source_t *source_reserve (const char *mount, int ret_exist);
+int  source_reserve (const char *mount, source_t **sp, int flags);
 void *source_client_thread (void *arg);
 int  source_startup (client_t *client, const char *uri);
 void source_update_settings (ice_config_t *config, source_t *source, mount_proxy *mountinfo);
 void source_clear_listeners (source_t *source);
 void source_clear_source (source_t *source);
+void source_reset_client_stats (source_t *source, int not_locked);
 source_t *source_find_mount(const char *mount);
 source_t *source_find_mount_raw(const char *mount);
 client_t *source_find_client(source_t *source, uint64_t id);
@@ -129,9 +134,9 @@ int  source_read (source_t *source);
 void source_setup_listener (source_t *source, client_t *client);
 void source_init (source_t *source);
 void source_shutdown (source_t *source, int with_fallback);
-void source_set_fallback (source_t *source, const char *dest_mount);
-int source_set_intro (source_t *source, const char *file_pattern);
-int  source_format_init (source_t *source);
+void source_set_fallback (source_t *source, fbinfo *fallback);
+int  source_set_intro (source_t *source, ice_config_t *_c, const char *file_pattern);
+int  source_format_init (source_t *source, client_t *client);
 void source_listeners_wakeup (source_t *source);
 
 int check_duplicate_logins (const char *mount, avl_tree *tree, client_t *client, auth_t *auth);

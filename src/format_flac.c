@@ -3,7 +3,8 @@
  * This program is distributed under the GNU General Public License, version 2.
  * A copy of this license is included with this source.
  *
- * Copyright 2000-2004, Jack Moffitt <jack@xiph.org, 
+ * Copyright 2010-2022, Karl Heyes <karl@kheyes.plus.com>,
+ * Copyright 2000-2004, Jack Moffitt <jack@xiph.org>,
  *                      Michael Smith <msmith@xiph.org>,
  *                      oddsock <oddsock@xiph.org>,
  *                      Karl Heyes <karl@xiph.org>
@@ -38,6 +39,7 @@ static void flac_codec_free (ogg_state_t *ogg_info, ogg_codec_t *codec)
     DEBUG0 ("freeing FLAC codec");
     stats_event (ogg_info->mount, "FLAC_version", NULL);
     ogg_stream_clear (&codec->os);
+    format_ogg_free_cached (codec);
     free (codec);
 }
 
@@ -47,31 +49,69 @@ static refbuf_t *process_flac_page (ogg_state_t *ogg_info, ogg_codec_t *codec, o
 {
     refbuf_t * refbuf;
 
-    if (codec->headers)
+    if (codec->headers > 0)
     {
+        int loop = 20, found_header = 0, packets = 0;
         ogg_packet packet;
-        if (ogg_stream_pagein (&codec->os, page) < 0)
+        if (ogg_stream_pagein (&codec->os, page) < 0)   // only put in pages during the header detection phase
         {
             ogg_info->error = 1;
             return NULL;
         }
-        while (ogg_stream_packetout (&codec->os, &packet))
+        do
         {
-            int type = packet.packet[0];
-            if (type == 0xFF)
+            int pkt = ogg_stream_packetout (&codec->os, &packet);
+
+            if (pkt > 0)
             {
-                codec->headers = 0;
-                break;
+                packets++;
+                if (codec->headers)
+                {
+                    int type = packet.packet[0];
+                    if ((type >= 0x01 && type <= 0x7E) || (type >= 0x81 && type <= 0xFE))
+                    {   // valid metadata code type
+                        codec->headers++;
+                        found_header++;
+                        continue;
+                    }
+                    if (type == 0x7F)
+                    {   // should never be encountered
+                        WARN0 ("Found another initial header packet");
+                        ogg_info->error = 1;
+                        return NULL;
+                    }
+                    // non-metadata packet
+                    if (found_header)
+                        WARN0 ("Found an unexpected packet with headers");
+                    else
+                        format_ogg_free_cached (codec); // found non-header packet, no headers outstanding
+                    DEBUG1 ("header packet count %d", codec->headers);
+                    codec->headers = 0;         // stop the header processing phase
+                }
+                continue;
             }
-            if (type >= 1 && type <= 0x7E)
-                continue;
-            if (type >= 0x81 && type <= 0xFE)
-                continue;
+            if (pkt == 0) break;     // usual loop exit path
+            loop--;
+        } while (loop);
+        if (loop == 0)
+        {   // packetout can occur but abort in such repeated cases
+            WARN0 ("Looping too many times, abort packetout loop");
             ogg_info->error = 1;
             return NULL;
         }
-        if (codec->headers)
+        if (packets == 0)
+        {   // unlikely but possible, page added but incomplete packet
+            DEBUG0 ("page cached in case of header packet");
+            refbuf = make_refbuf_with_page (codec, page);
+            *codec->cached_p = refbuf;
+            codec->cached_p = (void*)&refbuf->associated;
+            return NULL;
+        }
+        if (found_header)
         {
+            // add any previously undetermined header pages
+            format_ogg_attach_cached (codec);
+            DEBUG0("Adding header page");
             format_ogg_attach_header (codec, page);
             return NULL;
         }
@@ -98,19 +138,34 @@ ogg_codec_t *initial_flac_page (format_plugin_t *plugin, ogg_page *page)
     do
     {
         unsigned char *parse = packet.packet;
+        // format 0x7F F L A C, '1' x  y y f L a C zzzzz
+        // x   1 byte minor number
+        // y   2 BE byte count of header packets
+        // z   StreamINFO structure
 
         if (page->header_len + page->body_len != 79)
             break;
-        if (*parse != 0x7F)
-            break;
-        parse++;
-        if (memcmp (parse, "FLAC", 4) != 0)
+        if (parse[0] != 0x7F)
             break;
 
+        if (memcmp (parse+1, "FLAC", 4) != 0)
+            break;
+
+        if (parse[5] != 1)
+        {
+            WARN1 ("Unknown Ogg FLAC version %d, skipping", parse[5]);
+            break;
+        }
+        int headers = ((parse[7]<<8) + parse[8]) + 1; // include this one
+
+        if (memcmp (parse+9, "fLaC", 4) != 0)
+            break;
         INFO0 ("seen initial FLAC header");
-
-        parse += 4;
-        stats_event_args (ogg_info->mount, "FLAC_version", "%d.%d",  parse[0], parse[1]);
+        stats_event_args (ogg_info->mount, "FLAC_version", "%d.%d",  parse[5], parse[6]);
+        if (headers)
+            INFO1 ("FLAC stream reports to have %d headers", headers);
+        else
+            INFO0 ("FLAC stream has undefined number of headers, will check as they come in");
         codec->process_page = process_flac_page;
         codec->codec_free = flac_codec_free;
         codec->headers = 1;

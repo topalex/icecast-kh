@@ -3,7 +3,8 @@
  * This program is distributed under the GNU General Public License, version 2.
  * A copy of this license is included with this source.
  *
- * Copyright 2000-2004, Jack Moffitt <jack@xiph.org, 
+ * Copyright 2010-2022, Karl Heyes <karl@kheyes.plus.com>,
+ * Copyright 2000-2004, Jack Moffitt <jack@xiph.org>,
  *                      Michael Smith <msmith@xiph.org>,
  *                      oddsock <oddsock@xiph.org>,
  *                      Karl Heyes <karl@xiph.org>
@@ -18,6 +19,7 @@
 #ifndef __REFBUF_H__
 #define __REFBUF_H__
 
+#include <stdarg.h>
 #include <sys/types.h>
 
 typedef struct _refbuf_tag
@@ -45,12 +47,17 @@ void refbuf_release(refbuf_t *self);
 refbuf_t *refbuf_copy(refbuf_t *orig);
 refbuf_t *refbuf_copy_default (refbuf_t *orig);
 
+int refbuf_appendv (refbuf_t *refbuf, int max_len, const char *fmt, va_list ap);
+int refbuf_append (refbuf_t *refbuf, int max_len, const char *fmt, ...);
 
-#define PER_CLIENT_REFBUF_SIZE  4096
 
-#define WRITE_BLOCK_GENERIC     01000
-#define REFBUF_SHARED           02000
-#define BUFFER_LOCAL_USE        04000
+
+#define PER_CLIENT_REFBUF_SIZE          4096
+
+#define WRITE_BLOCK_GENERIC             (1<<8)
+#define REFBUF_SHARED                   (1<<9)
+#define BUFFER_LOCAL_USE                (1<<10)
+#define BUFFER_CONTAINS_HDR             (1<<11)
 
 #endif  /* __REFBUF_H__ */
 

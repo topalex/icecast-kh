@@ -2,6 +2,7 @@
  * - Thread Abstraction Function Headers
  *
  * Copyright (c) 1999, 2000 the icecast team <team@icecast.org>
+ * Copyright (c) 2019-2023 Karl Heyes <karl@kheyes.plus.com>
  *
  *  This library is free software; you can redistribute it and/or
  *  modify it under the terms of the GNU Library General Public
@@ -32,7 +33,7 @@ typedef struct {
 
     /* the time the thread was created */
     time_t create_time;
-    
+
     /* the file and line which created this thread */
     const char *file;
     int line;
@@ -62,8 +63,8 @@ typedef struct {
 
 #endif
     /* the file and line where the mutex was locked */
-    const char *file;
-    int line;    
+    char *file;
+    int line;
 
     /* the system specific mutex */
     pthread_mutex_t sys_mutex;
@@ -93,6 +94,7 @@ typedef struct {
 
     /* time the lock was taken */
     unsigned long long lock_start;
+    long lock_count;
 #endif
 
     pthread_rwlock_t sys_rwlock;
@@ -119,8 +121,10 @@ typedef mutex_t spin_t;
 typedef int (*thread_mx_create_func)(void**m, int create);
 typedef int (*thread_mx_lock_func)(void**m, int create);
 
-int thread_mtx_create_callback(void**m, int create);
-int thread_mtx_lock_callback(void**m, int lock);
+int thread_mtx_create_callback (void **p, const char *filename, size_t line, int alloc);
+int thread_mtx_lock_callback (void **p, const char *filename, size_t line, int lock);
+int thread_rw_create_callback (void **p, const char *filename, size_t line, int alloc);
+int thread_rw_lock_callback (void **p, const char *filename, size_t line, int lock);
 
 #define thread_create(n,x,y,z) thread_create_c(n,x,y,z,__LINE__,__FILE__)
 #define thread_mutex_create(x) thread_mutex_create_c(x,__LINE__,__FILE__)
@@ -145,6 +149,12 @@ int thread_mtx_lock_callback(void**m, int lock);
 #define MUTEX_STATE_UNINIT -3
 #define THREAD_DETACHED 1
 #define THREAD_ATTACHED 0
+
+#define THREAD_RWL_UNLOCK       0
+#define THREAD_RWL_RLOCK        1
+#define THREAD_RWL_WLOCK        2
+#define THREAD_RWL_TRYRLOCK     3
+#define THREAD_RWL_TRYWLOCK     4
 
 #ifdef _mangle
 # define thread_initialize _mangle(thread_initialize)
@@ -181,7 +191,7 @@ void thread_shutdown(void);
 void thread_use_log_id(int log_id);
 
 /* creation, destruction, locking, unlocking, signalling and waiting */
-thread_type *thread_create_c(char *name, void *(*start_routine)(void *), 
+thread_type *thread_create_c(char *name, void *(*start_routine)(void *),
         void *arg, int detached, int line, const char *file);
 void thread_mutex_create_c(mutex_t *mutex, int line, const char *file);
 void thread_mutex_lock_c(mutex_t *mutex, int line, const char *file);

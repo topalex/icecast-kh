@@ -12,10 +12,12 @@
 # which will generate the output file 'installer.exe' which is a Windows
 # installer containing your program.
 
-Name "Icecast KH"
-OutFile "icecast-2.4.0-kh15_win64_setup.exe"
+!include WinVer.nsh
 
-InstallDir "$ProgramFiles64\Icecast KH"
+Name "Icecast KH"
+OutFile "icecast-@PACKAGE_VERSION@_win32_setup.exe"
+
+InstallDir "$ProgramFiles\Icecast KH"
 InstallDirRegKey HKLM SOFTWARE\Icecast "Install_Dir"
 
 LoadLanguageFile "${NSISDIR}\Contrib\Language files\English.nlf"
@@ -31,12 +33,12 @@ XPStyle on
 
 ;Version Information
 
-VIProductVersion "2.4.0.15"
+VIProductVersion "2.4.0.22"
 VIAddVersionKey /LANG=${LANG_ENGLISH} "ProductName" "Icecast KH"
 VIAddVersionKey /LANG=${LANG_ENGLISH} "ProductVersion" "2.4.0"
-VIAddVersionKey /LANG=${LANG_ENGLISH} "LegalCopyright" "Karl Heyes @2000-2020"
+VIAddVersionKey /LANG=${LANG_ENGLISH} "LegalCopyright" "Karl Heyes @2000-2023"
 VIAddVersionKey /LANG=${LANG_ENGLISH} "FileDescription" "Icecast KH streaming media server installer"
-VIAddVersionKey /LANG=${LANG_ENGLISH} "FileVersion" "2.4.0-KH15"
+VIAddVersionKey /LANG=${LANG_ENGLISH} "FileVersion" "@PACKAGE_VERSION@"
 
 Page components
 Page directory
@@ -56,26 +58,30 @@ Section "Icecast Installation"
   SectionIn RO
 
   SetOutPath "$INSTDIR"
-  File /r "x64/*.dll"
+  File /r "x32/*.dll"
+
+  ${If} ${AtMostWin7}
+    FILE /r "x32/extra/*.dll"
+  ${EndIf}
 
   WriteUninstaller "$INSTDIR\Uninstall.exe"
 
-  File "x64/icecast.exe"
+  File "x32/icecast.exe"
   SetOverwrite off
-  File "x64/icecast.xml"
+  File "x32/icecast.xml"
   SetOverwrite on
 
   SetOutPath "$INSTDIR\logs"
-  File /r "x64/logs/"
+  File /r "x32/logs/"
 
   SetOutPath "$INSTDIR\admin"
-  File /r "x64/admin/"
+  File /r "x32/admin/"
 
   SetOutPath "$INSTDIR\doc"
-  File /r "x64/doc/"
+  File /r "x32/doc/"
 
   SetOutPath "$INSTDIR\web"
-  File /r "x64/web/"
+  File /r "x32/web/"
 
   WriteRegStr HKLM "Software\Microsoft\Windows\CurrentVersion\Uninstall\Icecast KH" \
                  "DisplayName" "Icecast KH"

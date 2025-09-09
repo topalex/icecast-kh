@@ -1,8 +1,11 @@
-/* 
+/*
 ** Logging framework.
 **
 ** This program is distributed under the GNU General Public License, version 2.
 ** A copy of this license is included with this source.
+
+** Copyright 2010-2023, Karl Heyes <karl@kheyes.plus.com>
+*  and others from the Xiph IceCast team over the years
 */
 
 #ifdef HAVE_CONFIG_H
@@ -16,6 +19,9 @@
 #include <stdarg.h>
 #include <string.h>
 #include <time.h>
+#ifdef HAVE_INTTYPES_H
+#include <inttypes.h>
+#endif
 #ifdef HAVE_SYS_TYPES_H
 #include <sys/types.h>
 #endif
@@ -25,170 +31,290 @@
 #ifdef HAVE_UNISTD_H
 #include <unistd.h>
 #endif
+#ifdef HAVE_SYS_TIME_H
+#include <sys/time.h>
+#endif
 
 
 #include "log.h"
 
 #define LOG_MAXLOGS logs_allocated
-#define LOG_MAXLINELEN 1024
+#define LOG_MAXLINELEN 1000
 
 
-static void *_logger_mutex;
+static void *_logger_rwl;
 static int _initialized = 0;
 
-static mx_create_func       log_mutex_alloc;
-static mx_lock_func         log_mutex_lock;
+static log_locking_t        _locks;
 static log_commit_callback  log_callback;
 
 
 typedef struct _log_entry_t
 {
-   struct _log_entry_t *next;
-   char *line;
-   unsigned int len;
+    struct _log_entry_t *next;
+    struct _log_entry_t *prev;
+    struct _log_entry_t *next_on_priority;
+    uint64_t id;
+    unsigned int len;
+    unsigned int plen;
+    int flags;
+    int priority;
+#ifdef HAVE_CLOCK_GETTIME
+    struct timespec tstamp;
+#else
+    struct timeval tstamp;
+#endif
+   char line [LOG_MAXLINELEN];
 } log_entry_t;
 
+typedef struct _log_priority
+{
+    log_level_t level;
+    unsigned present;
+    off_t size;
+    log_entry_t *head;
+    log_entry_t *tail;
+} log_priority_t;
 
 typedef struct log_tag
 {
-    int in_use;
-
-    unsigned level;
+    uint8_t in_use;
+    uint8_t archive_timestamp;
+    uint8_t level;
+    uint16_t flags;
+    unsigned int duration;
 
     char *filename;
     FILE *logfile;
-    off_t size;
     off_t trigger_level;
     time_t reopen_at;
-    unsigned int duration;
-    short archive_timestamp;
-    time_t recheck_time;
 
-    unsigned long buffer_bytes;
-    unsigned int entries;
-    unsigned int keep_entries;
-    log_entry_t *written_entry;
+    // these need the mutex
+    void *mutex;
+    time_t recheck_time;
+    off_t size;
+    log_entry_t *checked_entry;
     log_entry_t *log_head;
     log_entry_t *log_tail;
-    
+    int priority_count;
+    int freed_count;
+    log_entry_t *freed;
+    log_priority_t *priorities; // array
+
     char *buffer;
 } log_t;
+
+typedef struct
+{
+   int flags;
+   int id;
+   int line_len;
+   int priority;
+   int remain;
+   uint8_t level;
+   char *line;
+} log_lineinfo_t;
+
+typedef struct
+{
+   time_t now;
+   off_t fsize;
+   off_t psize;
+   int id;
+} log_run_t;
+
+
+// set internally
+#define LOG_CLOSING             (1<<8)
+#define LOG_TIME                (1<<9)
+#define LOG_MARK_ID             (1<<10)
 
 int logs_allocated;
 static log_t *loglist;
 
 static int _get_log_id(void);
-static void _release_log_id(int log_id);
-static void _lock_logger(void);
-static void _unlock_logger(void);
 static int do_log_run (int log_id);
 
+// for global rwlock using read lock
+#define _lock_logger()      do { if (_locks.rwl) _locks.rwl (&_logger_rwl, __FILE__, __LINE__, 1); } while (0)
+#define _wlock_logger()     do { if (_locks.rwl) _locks.rwl (&_logger_rwl, __FILE__, __LINE__, 2); } while (0)
+#define _unlock_logger()    do { if (_locks.rwl) _locks.rwl (&_logger_rwl, __FILE__, __LINE__, 0); } while (0)
+// for queue specific locking
+#define _lock_q(N)          do { if (_locks.mxl) _locks.mxl (&loglist[(N)].mutex, __FILE__, __LINE__, 1); } while(0)
+#define _unlock_q(N)        do { if (_locks.mxl) _locks.mxl (&loglist[(N)].mutex, __FILE__, __LINE__, 0); } while(0)
 
-static int _log_open (int id, time_t now)
+static char *_entry_line_start (int flags, log_entry_t*entry)
 {
+    char *line = entry->line;
+    if (flags & LOG_MARK_ID)
+        line += 24;
+    return line;
+}
+
+
+// called from the log thread
+//
+static int _log_open (log_run_t *lr)
+{
+    int id = lr->id;
+    int file_recheck = 0, reopen = 0, archive = 0, exists = 0;
+    FILE *oldf = NULL;
     if (loglist [id] . in_use == 0)
         return 0;
-
-    /* check for cases where an open of the logfile is wanted */
-    if (loglist [id] . logfile == NULL || 
-       (loglist [id] . duration && loglist [id] . reopen_at <= now) ||
-       (loglist [id] . trigger_level && loglist [id] . size > loglist [id] . trigger_level))
+    do
     {
-        if (loglist [id] . filename)  /* only re-open files where we have a name */
+        if (loglist [id].filename == NULL) break;
+        if (loglist [id].recheck_time <= lr->now)
+            file_recheck = 1;
+        if ((loglist [id].trigger_level && lr->fsize > loglist [id].trigger_level) ||
+                (loglist [id].duration && loglist [id].reopen_at <= lr->now))
+            archive = 1;
+        if (loglist [id].logfile == NULL || archive)
+            file_recheck = reopen = 1;
+
+        if (file_recheck)
         {
-            FILE *f = NULL;
+            _unlock_q (id);
+            int r = -1;
             struct stat st;
-            int exists = 0, archive = 1;
-
-            if (stat (loglist [id] . filename, &st) == 0)
+            if (loglist [id].logfile)
             {
-                exists = 1;
-                if ((loglist [id] . trigger_level && loglist [id] . size > loglist [id] . trigger_level) &&
-                        st.st_size < loglist [id] . trigger_level)
-                {  // log changed from under us, but less than trigger size, better reopen this and not archive for now.
-                   archive = 0;
-                }
+                if (access (loglist [id].filename, F_OK) == 0) // in case the log has been moved externally
+                    r = fstat (fileno (loglist [id].logfile), &st);
             }
-            if (loglist [id].logfile && loglist [id].logfile != stderr)
+            else
+                r = stat (loglist [id].filename, &st);
+
+            if (r < 0)
             {
-                char new_name [4096];
-                fclose (loglist [id] . logfile);
-                loglist [id] . logfile = NULL;
-                if (archive)
+                reopen = 1;
+                archive = 0;
+            }
+            else
+            {
+                if (S_ISREG (st.st_mode))
                 {
-                    if (loglist[id].archive_timestamp)
+                    // fprintf (stderr, "content check, trig %ld, file %ld, internal %ld\n", loglist [id].trigger_level, st.st_size, lr->fsize);
+                    exists = 1;
+                    if (lr->fsize != st.st_size)
                     {
-                        char timestamp [128];
-
-                        strftime (timestamp, sizeof (timestamp), "%Y%m%d_%H%M%S", localtime (&now));
-                        snprintf (new_name,  sizeof(new_name), "%s.%s", loglist[id].filename, timestamp);
-                    }
-                    else {
-                        snprintf (new_name,  sizeof(new_name), "%s.old", loglist [id] . filename);
-                    }
-                    if (exists)
-                    {
-#ifdef _WIN32
-                        remove (new_name);
-#endif
-                        rename (loglist [id] . filename, new_name);
+                        lr->fsize = st.st_size;
+                        archive = 0;
                     }
                 }
+                else
+                {
+                    reopen = 0;
+                    lr->fsize = 0;
+                }
             }
-            f = fopen (loglist [id] . filename, "a");
+            loglist [id].recheck_time = lr->now + 10;
+        }
+        if (reopen)
+        {
+            if (loglist [id].logfile == stderr)
+                break;
+            oldf = loglist [id].logfile;
+            char new_name [4096];
+            if (archive)
+            {
+                if (loglist[id].archive_timestamp)
+                {
+                    char timestamp [128];
+
+                    strftime (timestamp, sizeof (timestamp), "%Y%m%d_%H%M%S", localtime (&lr->now));
+                    snprintf (new_name,  sizeof(new_name), "%s.%s", loglist[id].filename, timestamp);
+                }
+                else {
+                    snprintf (new_name,  sizeof(new_name), "%s.old", loglist [id] . filename);
+                }
+                if (exists)
+                {
+#ifdef _WIN32
+                    if (oldf)
+                        fclose (oldf);  // windows does not allow for renames while open.
+                    loglist [id].logfile = oldf = NULL;
+                    remove (new_name);
+#endif
+                    rename (loglist [id].filename, new_name);
+                    exists = 0;
+                }
+            }
+            snprintf (new_name, sizeof new_name, "%s", loglist [id].filename);
+            FILE *f = fopen (new_name, "a+t");
             if (f == NULL)
             {
-                if (loglist [id] . logfile != stderr)
-                {
+                if (loglist [id].logfile != stderr)
                     loglist [id] . logfile = stderr;
-                    do_log_run (id);
-                }
-                return 0;
+                break;
             }
             loglist [id].logfile = f;
-            setvbuf (loglist [id] . logfile, NULL, IO_BUFFER_TYPE, 0);
-            if (stat (loglist [id] . filename, &st) < 0)
-                loglist [id] . size = 0;
-            else
-                loglist [id] . size = st.st_size;
+            if (exists == 0)
+                lr->fsize = 0;
             if (loglist [id] . duration)
-                loglist [id] . reopen_at = now + loglist [id] . duration;
-            loglist [id].recheck_time = now + 10;
+                loglist [id] . reopen_at = lr->now + loglist [id].duration;
         }
-        else
-            loglist [id] . size = 0;
-    }
+    } while (0);
+    if (oldf)
+        fclose (oldf);
+    if (file_recheck)
+        _lock_q (id);
     return 1;
 }
 
+
+void log_init_levels (int log_id, log_levels_t *ll, unsigned n)
+{
+    static const log_level_t defaults[] = {
+        { .name = "0",     .keep = 15   },
+        { .name = "1",     .keep = 15   },
+        { .name = "2",     .keep = 15   },
+        { .name = "3",     .keep = 15   },
+        { .name = "4",     .keep = 15   },
+    };
+    if (log_id < 0 || loglist[log_id].priority_count == 0)
+    {
+        if (n == 0 || n > 5)
+            n = sizeof (defaults) / sizeof (defaults[0]);
+        memcpy (&ll->level[0], defaults, sizeof defaults);
+        ll->flags = 0;
+        ll->count = n;
+        ll->mark = n-1;
+    }
+    else
+    {
+        for (int i = 0; i < loglist[log_id].priority_count; i++)
+            ll->level [i] = loglist [log_id].priorities [i].level;
+        ll->flags = loglist[log_id].flags;
+        ll->count = loglist[log_id].priority_count;
+        ll->mark = loglist [log_id].level;
+    }
+}
+
+
 static void log_init (log_t *log)
 {
-    log->in_use = 0;
+    memset (log, 0, sizeof (*log));
     log->level = 2;
-    log->size = 0;
     log->trigger_level = 50*1024*1024;
-    log->duration = 0;
     log->filename = NULL;
     log->logfile = NULL;
     log->buffer = NULL;
-    log->buffer_bytes = 0;
-    log->entries = 0;
-    log->keep_entries = 5;
-    log->written_entry = NULL;
-    log->log_head = NULL;
-    log->log_tail = NULL;
 }
 
-void log_initialize_lib (mx_create_func mxc, mx_lock_func mxl)
+
+void log_initialize_lib (log_locking_t *locks)
 {
     if (_initialized) return;
     logs_allocated = 0;
     loglist = NULL;
-    log_mutex_alloc = mxc ? mxc : NULL;
-    log_mutex_lock = mxl ? mxl : NULL;
+    if (locks)
+        memcpy (&_locks, locks, sizeof (*locks));
+    else
+        memset (&_locks, 0, sizeof (*locks));
 
-    if (log_mutex_alloc)
-        log_mutex_alloc (&_logger_mutex, 1);
+    if (_locks.rwc)
+        _locks.rwc (&_logger_rwl, __FILE__, __LINE__, 3);
     log_callback = NULL;
     _initialized = 1;
 }
@@ -217,9 +343,14 @@ int log_open_file(FILE *file)
 
     loglist[log_id].logfile = file;
     loglist[log_id].filename = NULL;
+    loglist[log_id].log_head = NULL;
+    loglist[log_id].log_tail = NULL;
     loglist[log_id].size = 0;
+    loglist[log_id].flags = 0;
     loglist[log_id].reopen_at = 0;
+    loglist[log_id].priority_count = 0;
     loglist[log_id].archive_timestamp = 0;
+    if (_locks.mxc) _locks.mxc (&loglist [log_id].mutex, __FILE__, __LINE__, 3);
 
     return log_id;
 }
@@ -236,16 +367,26 @@ int log_open(const char *filename)
 
     if (id >= 0)
     {
-        _lock_logger();
+        _wlock_logger();
         free (loglist [id] . filename);
         loglist [id] . filename = strdup (filename);
-        loglist [id].entries = 0;
         loglist [id].log_head = NULL;
         loglist [id].log_tail = NULL;
         loglist [id].logfile = NULL;
         loglist [id].size = 0;
+        loglist [id].flags = 0;
         loglist [id].reopen_at = 0;
         loglist [id].archive_timestamp = 0;
+        loglist [id].priority_count = 0;
+        for (int i = 80; i ; i--)
+        {
+            log_entry_t *ent = calloc (1, sizeof (log_entry_t));
+            ent->next = loglist [id].freed;
+            loglist [id].freed = ent;
+            loglist [id].freed_count++;
+        }
+        loglist [id].flags |= LOG_MARK_ID;
+        if (_locks.mxc) _locks.mxc (&loglist [id].mutex, __FILE__, __LINE__, 3);
         _unlock_logger();
     }
 
@@ -253,11 +394,142 @@ int log_open(const char *filename)
 }
 
 
+static void _set_priorities (int id, log_levels_t *level)
+{
+    if (loglist [id].in_use && loglist[id].log_head == NULL)
+    {
+        int count = level->count;
+        log_priority_t *n = loglist[id].priorities;
+        if (count != loglist[id].priority_count)
+        {
+            int newlen = count * sizeof (log_priority_t);
+            n = realloc (loglist[id].priorities, newlen);
+            if (n)
+            {
+                int oldlen = loglist[id].priority_count * sizeof (log_priority_t);
+                memset (&n[loglist[id].priority_count], 0, newlen - oldlen);
+                loglist[id].priorities = n;
+                loglist[id].priority_count = count;
+            }
+        }
+        for (int i=0; i < count; i++)
+            loglist[id].priorities[i].level = level->level[i];
+        loglist [id].level = level->mark;
+        loglist [id].flags = (level->flags|LOG_MARK_ID);
+    }
+}
+
+
+// called from first use if not set by user. will be read locked
+//
+static void default_set_priorities (int id)
+{
+    _unlock_logger();
+    log_levels_t ll;
+    _wlock_logger();
+    log_init_levels (id, &ll, 1);
+    _set_priorities (id, &ll);
+    _unlock_logger();
+    _lock_logger();
+}
+
+
+static void _release_entry (int log_id, log_entry_t *ent, int cache)
+{
+    if (ent == NULL) return;
+    log_t *log = &loglist [log_id];
+    if (cache && log->freed_count < 20)
+    {
+        ent->len = 0;
+        ent->next = log->freed;
+        log->freed = ent;
+        log->freed_count++;
+    }
+    else
+    {   // allow for some pruning in case
+        free (ent);
+    }
+}
+
+static void release_entry (int log_id, log_entry_t *ent, int cache)
+{
+    if (ent)
+    {
+        _lock_q (log_id);
+        _release_entry (log_id, ent, cache);
+        _unlock_q (log_id);
+    }
+}
+
+
+static log_entry_t *_get_cached_entry (log_lineinfo_t *info)
+{
+    int id = info->id;
+    log_t *log = &loglist [id];
+
+    static uint64_t _next_eid = 1;
+
+    _lock_q (id);
+    uint64_t entry_id = _next_eid++;
+    log_entry_t *ent = log->freed;
+    while (1)
+    {
+        if (ent == NULL)
+        {
+            _unlock_q (id);
+            ent = calloc (1, sizeof (log_entry_t));
+        }
+        else
+        {
+            log->freed_count--;
+            log->freed = ent->next;
+            _unlock_q (id);
+            ent->next = NULL;
+        }
+        break;
+    }
+    ent->id = entry_id;
+    int prelen = 0;
+    if (info->flags & LOG_TIME)
+    {
+        prelen += 23;   // "[YYYY-MM-DD  HH:MM:SS] "
+#ifdef HAVE_CLOCK_GETTIME
+        clock_gettime (CLOCK_REALTIME, &ent->tstamp);
+        const int ss = 10;  // .nS
+#elif defined(HAVE_GETTIMEOFDAY)
+        gettimeofday (&ent->tstamp, NULL);
+        const int ss = 7;   // .uS
+#else
+        ent->tstamp.tv_sec = (uint64_t)time (NULL);
+        const int ss = 1;
+#endif
+        if (loglist [id].flags & LOG_TIME_SS)
+        {
+            ent->flags |= LOG_TIME_SS;
+            prelen += ss;        // "[YYYY-MM-DD  HH:MM:SS.*] "
+        }
+        ent->flags |= LOG_TIME;
+    }
+    ent->plen = prelen;
+    ent->len = 0;
+    ent->priority = info->priority;
+    info->line = &ent->line[0];
+    info->remain = LOG_MAXLINELEN;
+    if (info->flags & LOG_MARK_ID)
+    {
+        int c = snprintf (&ent->line[0], LOG_MAXLINELEN, "%-24" PRIu64, entry_id);
+        info->line += c;
+        info->remain -= c;
+    }
+    return ent;
+}
+
+
 /* set the trigger level to trigger, represented in bytes */
 void log_set_trigger(int id, unsigned long trigger)
 {
-    _lock_logger();
-    if (id >= 0 && id < LOG_MAXLOGS && loglist [id] . in_use)
+    _wlock_logger();
+    if (id >= 0 && id < LOG_MAXLOGS && loglist [id].in_use)
     {
         if (trigger < 100000)
             trigger = 100000;
@@ -269,7 +541,7 @@ void log_set_trigger(int id, unsigned long trigger)
 
 void log_set_reopen_after (int id, unsigned int trigger)
 {
-    _lock_logger();
+    _wlock_logger();
     if (id >= 0 && id < LOG_MAXLOGS && loglist [id] . in_use)
     {
          loglist [id] . duration = trigger;
@@ -286,7 +558,7 @@ int log_set_filename(int id, const char *filename)
     /* NULL filename is ok, empty filename is not. */
     if (filename && !strcmp(filename, ""))
         return LOG_EINSANE;
-    _lock_logger();
+    _wlock_logger();
     if (loglist [id] . in_use)
     {
         if (loglist [id] . filename)
@@ -304,8 +576,9 @@ int log_set_archive_timestamp(int id, int value)
 {
     if (id < 0 || id >= LOG_MAXLOGS)
         return LOG_EINSANE;
-     _lock_logger();
-     loglist[id].archive_timestamp = value;
+     _wlock_logger();
+     if (loglist [id] . in_use)
+         loglist[id].archive_timestamp = value;
      _unlock_logger();
     return id;
 }
@@ -318,14 +591,18 @@ int log_open_with_buffer(const char *filename, int size)
 }
 
 
+// wrapper routine for compatability
 void log_set_lines_kept (int log_id, unsigned int count)
 {
     if (log_id < 0 || log_id >= LOG_MAXLOGS) return;
-    if (loglist[log_id].in_use == 0) return;
     if (count > 1000000) return;
 
-    _lock_logger ();
-    loglist[log_id].keep_entries = count;
+    _wlock_logger ();
+    log_levels_t ll;
+    log_init_levels (log_id, &ll, 1);
+    log_set_levels_keep (&ll, count);
+    _set_priorities (log_id, &ll);
+
     _unlock_logger ();
 }
 
@@ -333,18 +610,47 @@ void log_set_lines_kept (int log_id, unsigned int count)
 void log_set_level(int log_id, unsigned level)
 {
     if (log_id < 0 || log_id >= LOG_MAXLOGS) return;
-    _lock_logger();
+
+    uint16_t flags = level >> 8;
+    loglist[log_id].flags |= (flags & LOG_TIME_SS);
+    level &= 15;
+    _wlock_logger();
     if (loglist[log_id].in_use)
         loglist[log_id].level = level;
     _unlock_logger();
 }
+
+
+void log_set_levels (int log_id, log_levels_t *levels)
+{
+    if (log_id < 0 || log_id >= LOG_MAXLOGS) return;
+    _wlock_logger();
+    _set_priorities (log_id, levels);
+    _unlock_logger();
+}
+
+
+void log_set_levels_keep (log_levels_t *levels, unsigned int count)
+{
+    int i = levels->count == 1 ? 0 : 1;
+    int remainder = count;
+    int last = levels->count - 1;
+    for (; i < last; i++)
+    {
+        int each = remainder/(levels->count-i);
+        levels->level [i].keep = each;
+        remainder -= each;
+    }
+    levels->level [i].keep = remainder;
+}
+
 
 void log_flush(int log_id)
 {
     if (log_id < 0 || log_id >= LOG_MAXLOGS) return;
     if (loglist[log_id].in_use == 0) return;
 
-    _lock_logger();
+    _wlock_logger();
     if (loglist[log_id].logfile)
         fflush(loglist[log_id].logfile);
     _unlock_logger();
@@ -354,23 +660,15 @@ void log_reopen(int log_id)
 {
     if (log_id < 0 && log_id >= LOG_MAXLOGS)
         return;
-    _lock_logger();
+    _wlock_logger();
     do
     {
-        if (loglist [log_id] . filename == NULL || loglist [log_id] . logfile == NULL)
+        if (loglist [log_id] . filename == NULL || loglist [log_id].logfile == NULL)
             break;
-        if (loglist [log_id]. archive_timestamp < 0)
-        {
-            struct stat st;
-            fflush (loglist [log_id] . logfile);
-            if (stat (loglist [log_id] . filename, &st) == 0 && st.st_size == loglist [log_id].size)
-                break;
-            // a missing or different sized log indicates an external move so trigger a reopen
-        }
-        if (loglist [log_id] . logfile)
+        if (loglist [log_id].logfile)
         {
             fclose (loglist [log_id] . logfile);
-            loglist [log_id] . logfile = NULL;
+            loglist [log_id].logfile = NULL;
         }
     } while (0);
     _unlock_logger();
@@ -378,13 +676,16 @@ void log_reopen(int log_id)
 
 
 
+// enter with q lock, exit with it unlock and destroyed
+//
 static void _log_close_internal (int log_id)
 {
     if (log_id < 0 || log_id >= LOG_MAXLOGS) return;
 
-    int loop = 0;
-    while (++loop < 10 && do_log_run (log_id) > 0)
-        ;
+    for (int loop = 0; loop < 10; ++loop)
+        if (do_log_run (log_id) == 0)
+            break;
+
     loglist[log_id].level = 2;
     free (loglist[log_id].filename);
     loglist[log_id].filename = NULL;
@@ -399,13 +700,20 @@ static void _log_close_internal (int log_id)
     {
         log_entry_t *to_go = loglist [log_id].log_head;
         loglist [log_id].log_head = to_go->next;
-        loglist [log_id].buffer_bytes -= to_go->len;
-        free (to_go->line);
-        free (to_go);
-        loglist [log_id].entries--;
+        _release_entry (log_id, to_go, 0);
     }
-    loglist [log_id].written_entry = NULL;
-    loglist [log_id].entries = 0;
+    while (loglist [log_id].freed)
+    {
+        log_entry_t *to_go = loglist [log_id].freed;
+        loglist [log_id].freed = to_go->next;
+        loglist [log_id].freed_count--;
+        _release_entry (log_id, to_go, 0);
+    }
+    free (loglist [log_id].priorities);
+    loglist [log_id].priorities = NULL;
+    loglist [log_id].checked_entry = NULL;
+    _unlock_q (log_id);
+    if (_locks.mxc) _locks.mxc (&loglist [log_id].mutex, __FILE__, __LINE__, 0);
     loglist [log_id].in_use = 0;
 }
 
@@ -415,120 +723,230 @@ void log_close(int log_id)
     if (log_id < 0 || log_id >= LOG_MAXLOGS) return;
 
     _lock_logger();
-
-    if (loglist[log_id].in_use != 1)
+    do
     {
-        if (loglist[log_id].in_use == 3)
-            loglist[log_id].in_use = 1;
-        _unlock_logger();
-        return;
-    }
-    _log_close_internal (log_id);
+        if (log_callback)
+        {
+            if (loglist [log_id].in_use != 1)
+                break;
+            _lock_q (log_id);
+            loglist [log_id].flags |= LOG_CLOSING;
+            _unlock_q (log_id);
+            break;
+        }
+        _log_close_internal (log_id);
+    } while (0);
     _unlock_logger();
 }
 
 
 void log_shutdown(void)
 {
+    if (_initialized == 0)
+        return;
     int log_id;
     log_commit_entries ();
-    for (log_id = 0; log_id < logs_allocated ; log_id++)
+    // close 0 last as it is usually stderr
+    for (log_id = 1; log_id < logs_allocated ; log_id++)
         log_close (log_id);
+    log_close (0);
+    log_commit_entries ();
     logs_allocated = 0;
     free (loglist);
+    loglist = NULL;
     /* destroy mutexes */
-    if (log_mutex_alloc)
-        log_mutex_alloc (&_logger_mutex, 0);
+    if (_locks.rwc)
+        _locks.rwc (&_logger_rwl, __FILE__, __LINE__, 0);
 
     _initialized = 0;
 }
 
+
+static int _select_priority_entry (log_t *log)
+{
+    uint64_t earliest = log->checked_entry ? log->checked_entry->id : 0;
+    int pri_id = -1;
+    if (earliest > 0)
+    {
+        for (int i=0; i < log->priority_count; i++)
+        {
+           if (log->priorities[i].present <= log->priorities [i].level.keep)
+               continue;
+           if (log->priorities[i].head->id < earliest)
+           {
+              earliest = log->priorities[i].head->id;
+              pri_id = i;
+           }
+        }
+    }
+    return pri_id;
+}
+
+
+
 static log_entry_t *log_entry_pop (int log_id)
 {
-    log_entry_t *to_go = loglist [log_id].log_head;
+    log_t *log = &loglist [log_id];
+    int pri_id = _select_priority_entry (log);
 
-    if (to_go == NULL || loglist [log_id].written_entry == NULL || loglist [log_id].written_entry == to_go)
+    if (pri_id < 0)
         return NULL;
-    loglist [log_id].log_head = to_go->next;
-    loglist [log_id].buffer_bytes -= to_go->len;
-    loglist [log_id].entries--;
+    log_entry_t *to_go = log->priorities[pri_id].head;
+    // drop from priority list
+    log->priorities[pri_id].head = to_go->next_on_priority;
+    to_go->next_on_priority = NULL;
+    log->priorities[pri_id].present--;
+    int plen = (1 + to_go->len + to_go->plen);
+    log->priorities[pri_id].size -= plen;
 
-    if (to_go == loglist [log_id].log_tail)
-        loglist [log_id].log_tail = NULL;
-
-    if (to_go == loglist [log_id].written_entry)
-        loglist [log_id].written_entry = NULL;
-
+    // drop from timed list.
+    if (to_go->prev)
+        to_go->prev->next = to_go->next;
+    else
+        log->log_head = to_go->next;
+    if (to_go->next)
+        to_go->next->prev = to_go->prev;
+    to_go->next = to_go->prev = NULL;
     return to_go;
 }
+
+
+static int _log_expand_preline (log_entry_t *next, char *preline, size_t prelen)
+{
+    int r = 0;
+    if (next->flags & LOG_TIME)
+    {
+        struct tm thetime;
+        time_t secs = next->tstamp.tv_sec;
+        if (next->flags & LOG_TIME_SS)
+        {
+            r =  strftime (preline, prelen, "[%Y-%m-%d  %H:%M:%S", localtime_r(&secs, &thetime));
+#ifdef HAVE_CLOCK_GETTIME
+            r += snprintf (preline+r, prelen-r, ".%09ld] ", (long)next->tstamp.tv_nsec);
+#else
+            r += snprintf (preline+r, prelen-r, ".%06ld] ", (long)next->tstamp.tv_usec);
+#endif
+        }
+        else
+        {
+            r = strftime (preline, prelen, "[%Y-%m-%d  %H:%M:%S] ", localtime_r(&secs, &thetime));
+        }
+    }
+    return r;
+}
+
+
+// purge log entries back to least 1 on the specified log, assumes lock in use
+//
+static void do_purge (int log_id)
+{
+    int count = 0;
+    while (1)
+    {
+        log_entry_t *to_go = log_entry_pop (log_id);
+
+        if (to_go)
+        {
+            _release_entry (log_id, to_go, 1);
+            if (++count > 50)
+            {
+                _unlock_q (log_id);
+                count = 0; // reset count, allowing others to queue.
+                _lock_q (log_id);
+            }
+            continue;
+        }
+        break;
+    }
+}
+
 
 // flush out any waiting log entries
 //
 static int do_log_run (int log_id)
 {
-    log_entry_t *next;
+    log_entry_t *next, *checked;
     int loop = 0;
-    time_t now;
+    int count = 0;
 
-    loglist [log_id].in_use = 3;
-    time (&now);
-    if (loglist [log_id].written_entry == NULL)
-        next = loglist [log_id].log_head;
+    checked = loglist [log_id].checked_entry;
+    if (checked)
+        next = checked->next;
     else
-        next = loglist [log_id].written_entry->next;
+        next = loglist [log_id].log_head;
+    if (next == NULL)
+        return 0;
+    log_run_t lr = { .id = log_id, .fsize = loglist [log_id].size, .now = time (NULL) };
+    int flags = loglist [log_id].flags;
 
-    if (next && loglist[log_id].logfile && loglist [log_id] .filename && loglist [log_id].recheck_time <= now)
+    while (next && _log_open (&lr))
     {
-        struct stat st;
-        loglist [log_id].recheck_time = now + 6;
-        if (fstat (fileno(loglist[log_id].logfile), &st) < 0)
+        checked = next;
+        // fprintf (stderr, "   in log id %d, with (%s)\n", log_id, next->line);
+        if (loglist [log_id].level >= next->priority)
         {
-            loglist [log_id].size = loglist [log_id].trigger_level+1;
-            // fprintf (stderr, "recheck size of %s, failed\n", loglist [log_id] .filename);
+            _unlock_q (log_id);
+            char preline [64] = "";
+            _log_expand_preline (next, preline, sizeof preline);
+
+            int len = fprintf (loglist [log_id].logfile, "%s%s\n", preline, _entry_line_start (flags, next));
+            fflush (loglist [log_id].logfile);
+
+            if (len > 0)
+            {
+#ifdef _WIN32
+                len++;  // the \n translates to \r\n, but the return does not account for it
+#endif
+                lr.fsize += len;
+            }
+            loop = 0;
+            count++;
+            _lock_q (log_id);
         }
-        else
-        {
-            // fprintf (stderr, "recheck size of %s, %s\n", loglist [log_id] .filename, (loglist [log_id].size == st.st_size) ? "ok" :"different");
-            loglist [log_id] . size = st.st_size;
+        else if (++loop > 50)
+        {   // unlikely to trigger but provide an opening for the others
+            _unlock_q (log_id);
+            loop = 0;
+            _lock_q (log_id);
         }
-    }
-    // fprintf (stderr, "in log run, id %d\n", log_id);
-    while (next && ++loop < 300)
-    {
-        if (_log_open (log_id, now) == 0)
-            break;
-
-        loglist [log_id].written_entry = next;
-        _unlock_logger ();
-
-        // fprintf (stderr, "in log run, line is %s\n", next->line);
-        if (fprintf (loglist [log_id].logfile, "%s\n", next->line) >= 0)
-            loglist [log_id].size += (next->len + 1);
-
-        _lock_logger ();
         next = next->next;
     }
-    if (loglist [log_id].in_use == 3)
-        loglist [log_id].in_use = 1;    // normal route
-    else
-        _log_close_internal (log_id);   // log_close could of triggered
-    return loop;
+    loglist [log_id].checked_entry = checked;
+    loglist [log_id].size = lr.fsize;
+    do_purge (log_id);
+    return count;
 }
 
 void log_commit_entries ()
 {
-    int count = 0, c = 0, log_id;
+    int log_id, closing = 0;
 
     //fprintf (stderr, "in log commit\n");
     _lock_logger ();
     for (log_id = 0; log_id < logs_allocated ; log_id++)
     {
-        do
+        if (loglist [log_id].in_use)
         {
-            if (loglist [log_id].in_use)
-                c = do_log_run (log_id);
-            if (c == 0) break;      // skip to next log
-        } while ((count += c) < 1000);
+            _lock_q (log_id);
+            do_log_run (log_id);
+            if (loglist [log_id].flags & LOG_CLOSING)
+                closing++;
+            _unlock_q (log_id);
+        }
+    }
+    if (closing)
+    {   // any logs flagged for closing then close them here under the main lock
+        _unlock_logger ();
+        _wlock_logger ();
+        for (log_id = 0; closing && log_id < logs_allocated ; log_id++)
+        {
+            if (loglist [log_id].in_use && (loglist [log_id].flags & LOG_CLOSING))
+            {
+                _lock_q (log_id);
+                _log_close_internal (log_id);
+                closing--;
+            }
+        }
     }
     _unlock_logger ();
 }
@@ -542,57 +960,50 @@ void log_set_commit_callback (log_commit_callback f)
 }
 
 
-// purge log entries back to least 1 on the specified log, assumes lock in use
-//
-static void do_purge (int log_id)
+static int queue_entry (int log_id, log_entry_t *ent)
 {
-    int last = loglist [log_id].keep_entries;
+    log_t *log = &loglist [log_id];
+    log_priority_t *pri = &log->priorities [ent->priority];
+    int plen = 1 + ent->plen + ent->len;    // add space for NL
 
-    //fprintf (stderr, "in log purge, id %d, last %d, entries %d\n", log_id, last, loglist [log_id].entries);
-    while (loglist [log_id].entries > last)
-    {
-        log_entry_t *to_go = log_entry_pop (log_id);
+    _lock_q (log_id);
+    // timed order list update
 
-        if (to_go)
-        {
-            //fprintf (stderr, "  log purge (%d), %s\n", loglist [log_id].entries, to_go->line);
-            free (to_go->line);
-            free (to_go);
-            continue;
-        }
-        break;
-    }
-}
-
-
-static int create_log_entry (int log_id, const char *line)
-{
-    log_entry_t *entry;
-    int len;
-
-    entry = calloc (1, sizeof (log_entry_t));
-    len = entry->len = strlen (line);
-    entry->line = malloc (entry->len+1);
-    snprintf (entry->line, entry->len+1, "%s", line);
-    loglist [log_id].buffer_bytes += entry->len;
-
-    if (loglist [log_id].log_tail)
-        loglist [log_id].log_tail->next = entry;
+    if (log->log_tail)
+        log->log_tail->next = ent;
     else
-        loglist [log_id].log_head = entry;
+        log->log_head = ent;
+    ent->prev = log->log_tail;
+    log->log_tail = ent;
 
-    loglist [log_id].log_tail = entry;
-    loglist [log_id].entries++;
+    // priority order list update
+    pri->size += plen;
+    if (pri->tail)
+        pri->tail->next_on_priority = ent;
+    else
+        pri->head = ent;
+
+    pri->tail = ent;
+    pri->present++;
+
     if (log_callback)
-        log_callback (log_id);
+    {
+        _unlock_q (log_id);
+        //log_callback (log_id);
+    }
     else
+    {
         do_log_run (log_id);
-    do_purge (log_id);
-    return len;
+        if (loglist [log_id].flags & LOG_CLOSING)
+            _log_close_internal (log_id);   // log_close could of triggered
+        else
+            _unlock_q (log_id);
+    }
+    return 0;
 }
 
 
-int log_contents (int log_id, char **_contents, unsigned int *_len)
+int log_contents (int log_id, int level, char **_contents, unsigned int *_len)
 {
     int remain;
     log_entry_t *entry;
@@ -603,25 +1014,45 @@ int log_contents (int log_id, char **_contents, unsigned int *_len)
 
     if (_contents == NULL)
     {
-        _lock_logger ();  // normal initial route
+        _wlock_logger ();  // normal initial route
         if (loglist [log_id].in_use == 0)
         {
             _unlock_logger ();
             return -1;
         }
-        *_len = loglist [log_id].buffer_bytes + loglist [log_id].entries; // add space for newlines
-        return 1;
+        unsigned int len = 0;
+        if (loglist [log_id].priorities)
+        {
+            int l = (level >= 0 && level < loglist[log_id].priority_count) ? level : loglist [log_id].level;
+            while (1) {
+                len += loglist [log_id].priorities [l].size;
+                if (l == 0) break;
+                l--;
+            }
+        }
+        *_len = len;
+        return 1;   // return without unlock as we expect to be called again after allocation
     }
     remain = *_len;
 
+    if (level < 0)
+        level = loglist[log_id].level;
     entry = loglist [log_id].log_head;
     ptr = *_contents;
     *ptr = '\0';
-    while (entry && remain)
+    while (entry && remain > 0)
     {
-        int len = snprintf (ptr, remain, "%s\n", entry->line);
-        if (len > 0)
+        if (entry->priority <= level)
         {
+            char preline [64] = "";
+            _log_expand_preline (entry, preline, sizeof preline);
+            int len = snprintf (ptr, remain, "%s%s\n", preline, _entry_line_start (loglist [log_id].flags, entry));
+            if (len < 0 || len > remain)
+            {
+                ptr [0] = 0;
+                fprintf (stderr, "not enough space for content\n");
+                break;
+            }
             ptr += len;
             remain -= len;
         }
@@ -634,50 +1065,94 @@ int log_contents (int log_id, char **_contents, unsigned int *_len)
 }
 
 
-void log_write(int log_id, unsigned priority, const char *cat, const char *func, 
+static void lineinfo_complete (log_lineinfo_t *info, log_entry_t *ent)
+{
+    if (info->flags & LOG_MARK_ID)
+        ent->len = LOG_MAXLINELEN - 24 - info->remain;
+    else
+        ent->len = LOG_MAXLINELEN - info->remain;
+}
+
+
+// helper function for the printfs in the write calls.
+//
+static int lineinfo_adj (log_lineinfo_t *info, int r)
+{
+    if (r < 0 || r > info->remain) return -1;
+    if (r)
+    {
+        info->line += r;
+        info->remain -= r;
+    }
+    return LOG_MAXLINELEN - info->remain;
+}
+
+
+void log_write(int log_id, unsigned priority, const char *cat, const char *func,
         const char *fmt, ...)
 {
-    static char *prior[] = { "EROR", "WARN", "INFO", "DBUG" };
-    int datelen;
-    time_t now;
-    struct tm thetime;
-    char line[LOG_MAXLINELEN];
+    const char *p = NULL;
     va_list ap;
 
-    if (log_id < 0 || log_id >= LOG_MAXLOGS) return; /* Bad log number */
-    if (loglist[log_id].level < priority) return;
-    if (priority > sizeof(prior)/sizeof(prior[0])) return; /* Bad priority */
-
     va_start(ap, fmt);
-
-    now = time(NULL);
-
-    datelen = strftime (line, sizeof (line), "[%Y-%m-%d  %H:%M:%S]", localtime_r(&now, &thetime));
-
-    datelen += snprintf (line+datelen, sizeof line-datelen, " %s %s%s ", prior [priority-1], cat, func);
-    vsnprintf (line+datelen, sizeof line-datelen, fmt, ap);
-
     _lock_logger();
-    create_log_entry (log_id, line);
-    _unlock_logger();
 
+    do {
+        if (log_id < 0 || log_id >= LOG_MAXLOGS) break;         /* Bad log number */
+        if (loglist[log_id].priority_count == 0)
+            default_set_priorities (log_id);
+        if (priority >= loglist[log_id].priority_count) break;  /* Bad priority */
+        p = (loglist[log_id].priorities ? (loglist[log_id].priorities[priority].level.name) : "");
+
+        log_lineinfo_t info = { .id = log_id, .priority = priority, .flags = loglist [log_id].flags|LOG_TIME };
+        log_entry_t *entry = _get_cached_entry (&info);
+        do
+        {
+            if (entry == NULL) break;
+            if (lineinfo_adj (&info, snprintf  (info.line, info.remain, "%s %s%s ", p, cat, func)) < 0)
+                break;
+            if (lineinfo_adj (&info, vsnprintf (info.line, info.remain, fmt, ap)) < 0)
+                break;
+            lineinfo_complete (&info, entry);
+            queue_entry (log_id, entry);
+            entry = NULL;
+        } while (0);
+        release_entry (log_id, entry, 1);
+
+    } while (0);
+    _unlock_logger();
     va_end(ap);
 }
+
 
 void log_write_direct(int log_id, const char *fmt, ...)
 {
     va_list ap;
-    char line[LOG_MAXLINELEN];
 
-    if (log_id < 0 || log_id >= LOG_MAXLOGS) return;
-    
     va_start(ap, fmt);
-
     _lock_logger();
-    vsnprintf(line, LOG_MAXLINELEN, fmt, ap);
-    create_log_entry (log_id, line);
-    _unlock_logger();
+    do
+    {
+        if (log_id < 0 || log_id >= LOG_MAXLOGS) break;
+        if (loglist [log_id].in_use == 0) break;
 
+        if (loglist[log_id].priority_count == 0)
+            default_set_priorities (log_id);
+
+        log_lineinfo_t info = { .id = log_id, .flags = loglist[log_id].flags };
+        log_entry_t *entry = _get_cached_entry (&info);
+        do
+        {
+            if (lineinfo_adj (&info, vsnprintf (info.line, info.remain, fmt, ap)) < 0)
+                break;
+            entry->len = lineinfo_adj (&info, 0);
+            queue_entry (log_id, entry);
+            entry = NULL;
+        } while (0);
+        release_entry (log_id, entry, 1);
+
+    } while (0);
+    _unlock_logger();
     va_end(ap);
 }
 
@@ -687,7 +1162,7 @@ static int _get_log_id(void)
     int id = -1;
 
     /* lock mutex */
-    _lock_logger();
+    _wlock_logger();
 
     for (i = 0; i < logs_allocated; i++)
         if (loglist[i].in_use == 0) {
@@ -710,35 +1185,8 @@ static int _get_log_id(void)
         }
     }
 
-    /* unlock mutex */
     _unlock_logger();
 
     return id;
 }
-
-static void _release_log_id(int log_id)
-{
-    /* lock mutex */
-    _lock_logger();
-
-    loglist[log_id].in_use = 0;
-
-    /* unlock mutex */
-    _unlock_logger();
-}
-
-static void _lock_logger(void)
-{
-    if (log_mutex_lock)
-        log_mutex_lock (&_logger_mutex, 1);
-}
-
-static void _unlock_logger(void)
-{
-    if (log_mutex_lock)
-        log_mutex_lock (&_logger_mutex, 0);
-}
-
-
-
 

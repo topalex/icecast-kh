@@ -3,7 +3,8 @@
  * This program is distributed under the GNU General Public License, version 2.
  * A copy of this license is included with this source.
  *
- * Copyright 2000-2004, Jack Moffitt <jack@xiph.org, 
+ * Copyright 2010-2022, Karl Heyes <karl@kheyes.plus.com>,
+ * Copyright 2000-2004, Jack Moffitt <jack@xiph.org>,
  *                      Michael Smith <msmith@xiph.org>,
  *                      oddsock <oddsock@xiph.org>,
  *                      Karl Heyes <karl@xiph.org>
@@ -72,6 +73,7 @@ void stats_set_flags (stats_handle_t handle, const char *name, const char *value
 void stats_set_conv (stats_handle_t handle, const char *name, const char *value, const char *charset);
 void stats_set_time (stats_handle_t handle, const char *name, int flags, time_t tm);
 char *stats_retrieve (stats_handle_t handle, const char *name);
+const char *stats_retrieve_nocopy (stats_handle_t handle, const char *name);
 
 void stats_listener_to_xml (client_t *listener, xmlNodePtr parent);
 

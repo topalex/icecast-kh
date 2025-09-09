@@ -3,7 +3,8 @@
  * This program is distributed under the GNU General Public License, version 2.
  * A copy of this license is included with this source.
  *
- * Copyright 2000-2004, Jack Moffitt <jack@xiph.org, 
+ * Copyright 2020-2023, Karl Heyes <karl@kheyes.plus.com>,
+ * Copyright 2000-2004, Jack Moffitt <jack@xiph.org>,
  *                      Michael Smith <msmith@xiph.org>,
  *                      oddsock <oddsock@xiph.org>,
  *                      Karl Heyes <karl@xiph.org>
@@ -19,9 +20,9 @@ struct auth_tag;
 struct _fbinfo;
 typedef struct _auth_thread_t auth_thread_t;
 
-#include <libxml/xmlmemory.h>
-#include <libxml/parser.h>
 #include <libxml/tree.h>
+#include <inttypes.h>
+#include "cfgfile.h"
 #include "client.h"
 #include "thread/thread.h"
 
@@ -41,6 +42,8 @@ typedef struct auth_client_tag
     char        *hostname;
     int         port;
     int         handler;
+    uint32_t     flags;
+    unsigned char state;
     client_t    *client;
     struct auth_tag *auth;
     void        *thread_data;
@@ -115,8 +118,11 @@ int  auth_check_source (client_t *client, const char *mount);
 void auth_initialise (void);
 void auth_shutdown (void);
 
-int auth_get_authenticator (xmlNodePtr node, void *x);
+int auth_get_authenticator (auth_t *auth, struct _config_options *options);
 void    auth_release (auth_t *authenticator);
+
+// call after params set
+int auth_finish_setup (auth_t *auth, const char *name);
 
 /* call to trigger an event when a stream starts */
 void auth_stream_start (struct _mount_proxy *mountinfo, struct source_tag *source);

@@ -3,7 +3,8 @@
  * This program is distributed under the GNU General Public License, version 2.
  * A copy of this license is included with this source.
  *
- * Copyright 2000-2004, Jack Moffitt <jack@xiph.org, 
+ * Copyright 2010-2022, Karl Heyes <karl@kheyes.plus.com>
+ * Copyright 2000-2004, Jack Moffitt <jack@xiph.org>,
  *                      Michael Smith <msmith@xiph.org>,
  *                      oddsock <oddsock@xiph.org>,
  *                      Karl Heyes <karl@xiph.org>
@@ -21,7 +22,7 @@
 
 #define ICECAST_VERSION_STRING "Icecast " PACKAGE_VERSION
 
-#include "thread/thread.h"
+#include <signal.h>
 #include "net/sock.h"
 #include "compat.h"
 #include "avl/avl.h"
@@ -32,13 +33,13 @@ typedef struct ice_global_tag
     sock_t *serversock;
     struct _listener_t **server_conn;
 
-    int running;
+    volatile sig_atomic_t running;
+    volatile sig_atomic_t schedule_config_reread;
 
     int new_connections_slowdown;
     int sources;
     int clients;
     int listeners;
-    int schedule_config_reread;
 
     avl_tree *source_tree;
 
@@ -94,6 +95,7 @@ void global_initialize(void);
 void global_shutdown(void);
 void global_lock(void);
 void global_unlock(void);
+int  global_state(void);
 void global_add_bitrates (struct rate_calc *rate, unsigned long value, uint64_t milli);
 void global_reduce_bitrate_sampling (struct rate_calc *rate);
 unsigned long global_getrate_avg (struct rate_calc *rate);

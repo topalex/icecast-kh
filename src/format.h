@@ -3,7 +3,8 @@
  * This program is distributed under the GNU General Public License, version 2.
  * A copy of this license is included with this source.
  *
- * Copyright 2000-2004, Jack Moffitt <jack@xiph.org, 
+ * Copyright 2009-2023, Karl Heyes <karl@kheyes.plus.com>
+ * Copyright 2000-2004, Jack Moffitt <jack@xiph.org>,
  *                      Michael Smith <msmith@xiph.org>,
  *                      oddsock <oddsock@xiph.org>,
  *                      Karl Heyes <karl@xiph.org>
@@ -18,16 +19,24 @@
 #ifndef __FORMAT_H__
 #define __FORMAT_H__
 
+#include <inttypes.h>
+typedef uint8_t format_type_t;
+
 #include "client.h"
 #include "refbuf.h"
-#include "mpeg.h"
+#include "params.h"
 
 struct source_tag;
 struct _mount_proxy;
 
-typedef frame_type_t format_type_t;
+#define FORMAT_TYPE_UNDEFINED       0   /* No format determined */
+#define FORMAT_TYPE_OGG             1
+#define FORMAT_TYPE_AAC             2   // for AAC/ADTS style content
+#define FORMAT_TYPE_MPEG            3   // for MPEG1/2/ADTS type content
+#define FORMAT_TYPE_MP4             4
+#define FORMAT_TYPE_EBML            5
+#define FORMAT_TYPE_USAC            6   // USAC/LOAS framed aac
 
-#include "fserve.h"
 
 typedef struct _format_plugin_tag format_plugin_t;
 
@@ -38,7 +47,7 @@ typedef struct _format_plugin_tag format_plugin_t;
 typedef struct format_check_t
 {
     icefile_handle fd;
-    frame_type_t type;
+    format_type_t type;
     unsigned short channels;
     const char *desc;
     long offset;
@@ -64,7 +73,7 @@ struct _format_plugin_tag
     refbuf_t *(*get_buffer)(struct source_tag *);
     int (*write_buf_to_client)(client_t *client);
     void (*write_buf_to_file)(struct source_tag *source, refbuf_t *refbuf);
-    int (*create_client_data)(format_plugin_t *plugin, client_t *client);
+    int (*create_client_data)(format_plugin_t *plugin, ice_http_t *http, client_t *client);
     void (*set_tag)(struct _format_plugin_tag *plugin, const char *tag, const char *value, const char *charset);
     void (*free_plugin)(struct _format_plugin_tag *self, client_t *client);
     void (*apply_client)(struct _format_plugin_tag *self, client_t *client);
@@ -85,10 +94,7 @@ int format_generic_write_to_client (client_t *client);
 
 int format_check_frames (struct format_check_t *c);
 int format_file_read (client_t *client, format_plugin_t *plugin, icefile_handle f);
-int format_general_headers (format_plugin_t *plugin, client_t *client);
-
-void format_send_general_headers(format_plugin_t *format, 
-        struct source_tag *source, client_t *client);
+int format_client_headers (format_plugin_t *plugin, ice_http_t *http, client_t *client);
 
 void format_plugin_clear (format_plugin_t *format, client_t *client);
 void format_apply_client (format_plugin_t *format, client_t *client);
